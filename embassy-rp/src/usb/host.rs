@@ -1446,6 +1446,18 @@ impl<'d, T: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, T> {
     ) -> Result<Self::Pipe<E, D>, HostError> {
         let state = T::host_state();
         let pre = split_to_pre(split);
+
+        // `max_packet_size` comes from the device. Reject one we cannot buffer here, so a bad
+        // descriptor fails its own pipe instead of overrunning a neighbour or panicking.
+        let buf_limit = if E::ep_type() == EndpointType::Interrupt {
+            EPX_BLOCK_SIZE
+        } else {
+            EPX_NUM_BLOCKS * EPX_BLOCK_SIZE
+        };
+        if endpoint.max_packet_size as usize > buf_limit {
+            return Err(HostError::InvalidDescriptor);
+        }
+
         if E::ep_type() == EndpointType::Interrupt {
             let free_index = critical_section::with(|_| {
                 let alloc = state.allocated_pipes.load(Ordering::Relaxed);
@@ -1459,7 +1471,14 @@ impl<'d, T: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, T> {
             // Fixed layout: pipe index 1..EP_COUNT maps to block 0..EP_COUNT-1.
             let addr = DPRAM_DATA_OFFSET + (free_index as u16 - 1) * EPX_BLOCK_SIZE as u16;
 
-            Ok(Channel::new(free_index as _, addr, 64, endpoint, dev_addr, pre))
+            Ok(Channel::new(
+                free_index as _,
+                addr,
+                EPX_BLOCK_SIZE as u16,
+                endpoint,
+                dev_addr,
+                pre,
+            ))
         } else {
             let index = critical_section::with(|_| {
                 let alloc = state.allocated_epx.load(Ordering::Relaxed);
