@@ -102,7 +102,7 @@ fn default_timeout() -> TimeoutConfig {
 struct EpxArbiter {
     /// Bitset of EPX pipes whose transaction was stopped at a NAK boundary.
     yielded: u16,
-    /// Bitset of EPX pipes queued in `wait_ready_for_transaction`.
+    /// Bitset of EPX pipes queued in `lock_epx`.
     waiting: u16,
     /// Whether EPX has a transaction armed. Framing errors come from the shared RX
     /// engine, so they are only charged to EPX while it is mid-transaction.
@@ -787,33 +787,37 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         }
     }
 
-    async fn wait_ready_for_transaction(&self) {
+    /// Take EPX for this pipe. The guard releases it.
+    ///
+    /// The ticket must span both waits: leaving the queue early would let another pipe be
+    /// granted the turn while this one is still settling its buffer.
+    async fn lock_epx(&self) -> EpxTransactionGuard<T> {
         trace!("CHANNEL {} WAIT READY", self.index);
 
-        // Join the queue for EPX. Dropped with this future, cancelled or not.
-        let _ticket = (!Self::is_interrupt()).then(|| WaitTicket::<T>::new(self.epx_slot()));
-        // Wait for other transaction end
-        poll_fn(|cx| {
-            self.waker().register(cx.waker());
+        {
+            let _ticket = WaitTicket::<T>::new(self.epx_slot());
+            poll_fn(|cx| {
+                self.waker().register(cx.waker());
 
-            if self.can_run_epx_transaction() {
-                #[cfg(feature = "_rp235x")]
-                if !Self::is_interrupt() {
+                if self.can_run_epx_transaction() {
+                    #[cfg(feature = "_rp235x")]
                     disarm_epx_yield::<T>();
+
+                    return Poll::Ready(());
                 }
 
-                return Poll::Ready(());
-            }
+                trace!("CHANNEL {} EPX contention: request yield", self.index);
+                arm_epx_yield::<T>();
 
-            trace!("CHANNEL {} EPX contention: request yield", self.index);
-            arm_epx_yield::<T>();
+                Poll::Pending
+            })
+            .await;
 
-            Poll::Pending
-        })
-        .await;
+            self.wait_available().await;
+        }
 
-        // Once this pipe owns EPX, wait for its transfer buffer to be free.
-        self.wait_available().await;
+        self.set_current();
+        self.epx_transaction_guard()
     }
 
     // FIXME: RX Timeout with LS device on hub
@@ -1079,9 +1083,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             .map(|us| embassy_time::Instant::now() + embassy_time::Duration::from_micros(us));
 
         loop {
-            self.wait_ready_for_transaction().await;
-            self.set_current();
-            let mut guard = self.epx_transaction_guard();
+            let mut guard = self.lock_epx().await;
 
             arm(self);
             guard.arm();
@@ -1221,7 +1223,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
     {
         // An interrupt pipe owns its endpoint for the whole read.
         if Self::is_interrupt() {
-            self.wait_ready_for_transaction().await;
+            self.wait_available().await;
             self.set_current();
         }
 
