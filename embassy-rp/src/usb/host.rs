@@ -689,7 +689,7 @@ impl<T: SealedHostInstance> Drop for TransactionGuard<T> {
 impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T, E, D> {
     /// Get channel waker
     fn waker(&self) -> &AtomicWaker {
-        if Self::is_interrupt_in() {
+        if Self::is_interrupt() {
             &EP_IN_WAKERS[self.index]
         } else {
             &T::host_state().epx_wakers[self.epx_slot()]
@@ -703,7 +703,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Get buffer control register
     fn buffer_control(&self) -> BufferControlReg {
-        let index = if Self::is_interrupt_in() {
+        let index = if Self::is_interrupt() {
             // Validated 1-15
             self.index
         } else {
@@ -732,7 +732,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Get endpoint control register
     fn ep_control(&self) -> EpControlReg {
-        if Self::is_interrupt_in() {
+        if Self::is_interrupt() {
             T::dpram().ep_in_control(self.index - 1)
         } else {
             T::dpram_epx_control()
@@ -741,12 +741,13 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Get interrupt endpoint address control
     fn addr_endp_host(&self) -> AddrControlReg {
-        assert!(Self::is_interrupt_in());
+        assert!(Self::is_interrupt());
         T::regs().addr_endp_x(self.index - 1)
     }
 
-    fn is_interrupt_in() -> bool {
-        E::ep_type() == EndpointType::Interrupt && D::is_in()
+    /// Interrupt endpoints get their own hardware; everything else shares EPX.
+    fn is_interrupt() -> bool {
+        E::ep_type() == EndpointType::Interrupt
     }
 
     /// Wait for buffer to be available
@@ -776,7 +777,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// Is hardware configured to perform transaction with this buffer
     /// Always true for INTERRUPT channel
     fn is_ready_for_transaction(&self) -> bool {
-        if Self::is_interrupt_in() {
+        if Self::is_interrupt() {
             true
         } else {
             let state = T::host_state();
@@ -801,14 +802,14 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         trace!("CHANNEL {} WAIT READY", self.index);
 
         // Join the queue for EPX. Dropped with this future, cancelled or not.
-        let _ticket = (!Self::is_interrupt_in()).then(|| WaitTicket::<T>::new(self.epx_slot()));
+        let _ticket = (!Self::is_interrupt()).then(|| WaitTicket::<T>::new(self.epx_slot()));
         // Wait for other transaction end
         poll_fn(|cx| {
             self.waker().register(cx.waker());
 
             if self.is_ready_for_transaction() {
                 #[cfg(feature = "_rp235x")]
-                if !Self::is_interrupt_in() {
+                if !Self::is_interrupt() {
                     disarm_epx_yield::<T>();
                 }
 
@@ -829,7 +830,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     // FIXME: RX Timeout with LS device on hub
     /// Start transaction and wait it to be complete
     async fn wait_transaction(&self) -> Result<TransactionStatus, PipeError> {
-        assert!(!Self::is_interrupt_in());
+        assert!(!Self::is_interrupt());
         let regs = T::regs();
 
         // Enable error and cplt interrupts
@@ -897,7 +898,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             self.max_packet_size,
             self.pre
         );
-        if Self::is_interrupt_in() {
+        if Self::is_interrupt() {
             self.ep_control().write(|w| {
                 w.set_endpoint_type(EpControlEndpointType::Interrupt);
                 w.set_interrupt_per_buff(true);
@@ -952,7 +953,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         TransactionGuard {
             state: T::host_state(),
             index: self.index,
-            interrupt: Self::is_interrupt_in(),
+            interrupt: Self::is_interrupt(),
             ep_control: self.ep_control(),
             buffer_control: self.buffer_control(),
             transaction_active: false,
@@ -1073,7 +1074,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Clear buffer interrupt bit
     fn clear_sie_status(&self) {
-        if Self::is_interrupt_in() {
+        if Self::is_interrupt() {
             T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
         } else {
             T::regs().buff_status().write_clear(|w| w.0 = 0b11);
@@ -1229,7 +1230,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
         D: pipe::IsIn,
     {
         // An interrupt pipe owns its endpoint for the whole read.
-        let _interrupt_guard = if Self::is_interrupt_in() {
+        let _interrupt_guard = if Self::is_interrupt() {
             self.wait_ready_for_transaction().await;
             self.set_current();
             Some(self.transaction_guard())
@@ -1240,7 +1241,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
         let mut count: usize = 0;
 
         let res = loop {
-            let rx_len = if Self::is_interrupt_in() {
+            let rx_len = if Self::is_interrupt() {
                 let ctrl = self.buffer_control().read();
                 if ctrl.full(0) {
                     // A packet arrived while nobody was reading. Take it as it stands:
@@ -1277,7 +1278,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
             self.buf.read(&mut free[..rx_len]);
             count += rx_len;
 
-            if Self::is_interrupt_in() {
+            if Self::is_interrupt() {
                 self.advance_pid();
                 self.interrupt_reload();
                 break Ok(count);
