@@ -620,17 +620,16 @@ enum TransactionStatus {
     Timeout,
 }
 
-struct TransactionGuard<T: SealedHostInstance> {
+struct EpxTransactionGuard<T: SealedHostInstance> {
     state: &'static HostState,
     index: usize,
-    interrupt: bool,
     ep_control: EpControlReg,
     buffer_control: BufferControlReg,
     transaction_active: bool,
     _phantom: PhantomData<T>,
 }
 
-impl<T: SealedHostInstance> TransactionGuard<T> {
+impl<T: SealedHostInstance> EpxTransactionGuard<T> {
     fn arm(&mut self) {
         self.transaction_active = true;
         self.state.with_arbiter(|a| a.armed = true);
@@ -642,13 +641,8 @@ impl<T: SealedHostInstance> TransactionGuard<T> {
     }
 }
 
-impl<T: SealedHostInstance> Drop for TransactionGuard<T> {
+impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
     fn drop(&mut self) {
-        // Dedicated interrupt endpoints belong to the pipe
-        if self.interrupt {
-            return;
-        }
-
         let selected = self.state.current_channel.load(Ordering::Relaxed);
         if selected == self.index || selected == 0 {
             // Any armed transaction must be stopped before the endpoint registers are
@@ -829,7 +823,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     // FIXME: RX Timeout with LS device on hub
     /// Start transaction and wait it to be complete
-    async fn wait_transaction(&self) -> Result<TransactionStatus, PipeError> {
+    async fn wait_epx_transaction(&self) -> Result<TransactionStatus, PipeError> {
         assert!(!Self::is_interrupt());
         let regs = T::regs();
 
@@ -949,11 +943,12 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         }
     }
 
-    fn transaction_guard(&self) -> TransactionGuard<T> {
-        TransactionGuard {
+    /// EPX only.
+    fn epx_transaction_guard(&self) -> EpxTransactionGuard<T> {
+        debug_assert!(!Self::is_interrupt());
+        EpxTransactionGuard {
             state: T::host_state(),
             index: self.index,
-            interrupt: Self::is_interrupt(),
             ep_control: self.ep_control(),
             buffer_control: self.buffer_control(),
             transaction_active: false,
@@ -1083,7 +1078,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Claim EPX and run one transaction on it. `arm` programs the buffer once this
     /// pipe owns the endpoint.
-    async fn run_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
+    async fn run_epx_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
         let deadline = self
             .control_timeout_us
             .map(|us| embassy_time::Instant::now() + embassy_time::Duration::from_micros(us));
@@ -1091,17 +1086,17 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         loop {
             self.wait_ready_for_transaction().await;
             self.set_current();
-            let mut guard = self.transaction_guard();
+            let mut guard = self.epx_transaction_guard();
 
             arm(self);
             guard.arm();
             let result = if let Some(deadline) = deadline {
-                match embassy_time::with_deadline(deadline, self.wait_transaction()).await {
+                match embassy_time::with_deadline(deadline, self.wait_epx_transaction()).await {
                     Ok(result) => result,
                     Err(_) => Ok(self.stop_timed_out_transaction()),
                 }
             } else {
-                self.wait_transaction().await
+                self.wait_epx_transaction().await
             };
 
             // Only a completed transaction is known to have released the SIE, so any other
@@ -1130,7 +1125,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Receive one packet, returning its length.
     async fn transfer_in_packet(&mut self, len: u16, pid: bool) -> Result<usize, PipeError> {
-        self.run_transaction(|s| s.set_data_in(len, pid)).await?;
+        self.run_epx_transaction(|s| s.set_data_in(len, pid)).await?;
 
         Ok(self.buffer_control().read().length(0) as usize)
     }
@@ -1138,7 +1133,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// Send one packet, returning how much of `data` it carried.
     async fn transfer_out_packet(&mut self, data: &[u8], pid: bool) -> Result<usize, PipeError> {
         let mut len = 0;
-        self.run_transaction(|s| len = s.set_data_out(data, pid)).await?;
+        self.run_epx_transaction(|s| len = s.set_data_out(data, pid)).await?;
 
         Ok(len)
     }
@@ -1148,7 +1143,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// WARNING: This flips PID
     async fn send_setup(&mut self, setup: &[u8; 8]) -> Result<(), PipeError> {
         trace!("SEND SETUP");
-        self.run_transaction(|s| s.set_setup_packet(setup)).await?;
+        self.run_epx_transaction(|s| s.set_setup_packet(setup)).await?;
         self.pid = true;
 
         Ok(())
@@ -1158,7 +1153,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     async fn control_status(&mut self, active_direction_out: bool) -> Result<(), PipeError> {
         // Status packet always have DATA1
         trace!("SEND STATUS");
-        self.run_transaction(|s| {
+        self.run_epx_transaction(|s| {
             if active_direction_out {
                 s.set_data_in(0, true);
             } else {
@@ -1230,13 +1225,10 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
         D: pipe::IsIn,
     {
         // An interrupt pipe owns its endpoint for the whole read.
-        let _interrupt_guard = if Self::is_interrupt() {
+        if Self::is_interrupt() {
             self.wait_ready_for_transaction().await;
             self.set_current();
-            Some(self.transaction_guard())
-        } else {
-            None
-        };
+        }
 
         let mut count: usize = 0;
 
