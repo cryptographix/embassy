@@ -15,7 +15,7 @@ use embassy_usb_driver::EndpointType;
 use embassy_usb_driver::host::{PipeError, pipe};
 
 use super::super::{DPRAM_DATA_OFFSET, EP_COUNT, EP_MEMORY_SIZE};
-use super::{Channel, EpxTransactionGuard, HostState, SIE_START_DELAY_CYCLES, SealedHostInstance, TransactionStatus};
+use super::{BufferControlReg, Channel, EpControlReg, HostState, SIE_START_DELAY_CYCLES, SealedHostInstance};
 use crate::RegExt;
 
 // DPRAM layout - `EP_COUNT` blocks for control and interrupts, then remaining blocks
@@ -444,6 +444,76 @@ impl EpxState {
     /// Void any outcome the interrupt recorded for a pipe's finished attempt.
     pub(super) fn discard_epx_outcome(&self, slot: usize) {
         self.with_arbiter(|a| a.discard_outcome(slot));
+    }
+}
+
+/// Outcome of one EPX transaction attempt.
+pub(super) enum TransactionStatus {
+    /// The transaction ran to completion.
+    Complete,
+    /// EPX was taken away at a NAK boundary; the caller should retry.
+    NakYield,
+    /// The software response budget expired.
+    Timeout,
+}
+
+pub(super) struct EpxTransactionGuard<T: SealedHostInstance> {
+    pub(super) state: &'static HostState,
+    pub(super) index: usize,
+    pub(super) ep_control: EpControlReg,
+    pub(super) buffer_control: BufferControlReg,
+    pub(super) transaction_active: bool,
+    pub(super) _phantom: PhantomData<T>,
+}
+
+impl<T: SealedHostInstance> EpxTransactionGuard<T> {
+    pub(super) fn arm(&mut self) {
+        self.transaction_active = true;
+        self.state.epx.with_arbiter(|a| a.armed = true);
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.transaction_active = false;
+        self.state.epx.with_arbiter(|a| a.armed = false);
+    }
+}
+
+impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
+    fn drop(&mut self) {
+        let selected = self.state.epx.current_channel.load(Ordering::Relaxed);
+        if selected == self.index || selected == 0 {
+            // Any armed transaction must be stopped before the endpoint registers are
+            // torn down below, or the SIE may still be driving the bus while they change.
+            if self.transaction_active {
+                let regs = T::regs();
+                regs.sie_ctrl().modify(|w| w.set_stop_trans(true));
+                while regs.sie_ctrl().read().stop_trans() {}
+                regs.sie_status().write_clear(|w| {
+                    w.set_trans_complete(true);
+                    w.set_stall_rec(true);
+                    w.set_rx_timeout(true);
+                    w.set_rx_overflow(true);
+                });
+                regs.buff_status().write_clear(|w| w.0 = 0b11);
+            }
+            if let Some(slot) = EpxState::epx_slot(self.index) {
+                self.state.epx.with_arbiter(|a| a.last = slot);
+
+                // This attempt is over. A cancelled transfer never consumes its recorded
+                // outcome, and the next transaction would take it as its own.
+                self.state.epx.discard_epx_outcome(slot);
+            }
+            self.state.epx.with_arbiter(|a| a.armed = false);
+            self.state.epx.current_channel.store(0, Ordering::Release);
+            disarm_epx_yield::<T>();
+            self.state.epx.wake_all_epx();
+
+            self.ep_control.modify(|w| {
+                w.set_interrupt_per_buff(false);
+                w.set_enable(false);
+            });
+            self.buffer_control.modify(|w| w.set_available(0, false));
+        }
     }
 }
 

@@ -233,79 +233,9 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     }
 }
 
-type BufferControlReg = rp_pac::common::Reg<rp_pac::usb_dpram::regs::EpBufferControl, rp_pac::common::RW>;
-type EpControlReg = rp_pac::common::Reg<rp_pac::usb_dpram::regs::EpControl, rp_pac::common::RW>;
+pub(super) type BufferControlReg = rp_pac::common::Reg<rp_pac::usb_dpram::regs::EpBufferControl, rp_pac::common::RW>;
+pub(super) type EpControlReg = rp_pac::common::Reg<rp_pac::usb_dpram::regs::EpControl, rp_pac::common::RW>;
 type AddrControlReg = rp_pac::common::Reg<rp_pac::usb::regs::AddrEndpX, rp_pac::common::RW>;
-
-/// Outcome of one EPX transaction attempt.
-enum TransactionStatus {
-    /// The transaction ran to completion.
-    Complete,
-    /// EPX was taken away at a NAK boundary; the caller should retry.
-    NakYield,
-    /// The software response budget expired.
-    Timeout,
-}
-
-struct EpxTransactionGuard<T: SealedHostInstance> {
-    state: &'static HostState,
-    index: usize,
-    ep_control: EpControlReg,
-    buffer_control: BufferControlReg,
-    transaction_active: bool,
-    _phantom: PhantomData<T>,
-}
-
-impl<T: SealedHostInstance> EpxTransactionGuard<T> {
-    fn arm(&mut self) {
-        self.transaction_active = true;
-        self.state.epx.with_arbiter(|a| a.armed = true);
-    }
-
-    fn disarm(&mut self) {
-        self.transaction_active = false;
-        self.state.epx.with_arbiter(|a| a.armed = false);
-    }
-}
-
-impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
-    fn drop(&mut self) {
-        let selected = self.state.epx.current_channel.load(Ordering::Relaxed);
-        if selected == self.index || selected == 0 {
-            // Any armed transaction must be stopped before the endpoint registers are
-            // torn down below, or the SIE may still be driving the bus while they change.
-            if self.transaction_active {
-                let regs = T::regs();
-                regs.sie_ctrl().modify(|w| w.set_stop_trans(true));
-                while regs.sie_ctrl().read().stop_trans() {}
-                regs.sie_status().write_clear(|w| {
-                    w.set_trans_complete(true);
-                    w.set_stall_rec(true);
-                    w.set_rx_timeout(true);
-                    w.set_rx_overflow(true);
-                });
-                regs.buff_status().write_clear(|w| w.0 = 0b11);
-            }
-            if let Some(slot) = EpxState::epx_slot(self.index) {
-                self.state.epx.with_arbiter(|a| a.last = slot);
-
-                // This attempt is over. A cancelled transfer never consumes its recorded
-                // outcome, and the next transaction would take it as its own.
-                self.state.epx.discard_epx_outcome(slot);
-            }
-            self.state.epx.with_arbiter(|a| a.armed = false);
-            self.state.epx.current_channel.store(0, Ordering::Release);
-            disarm_epx_yield::<T>();
-            self.state.epx.wake_all_epx();
-
-            self.ep_control.modify(|w| {
-                w.set_interrupt_per_buff(false);
-                w.set_enable(false);
-            });
-            self.buffer_control.modify(|w| w.set_available(0, false));
-        }
-    }
-}
 
 impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T, E, D> {
     /// Get channel waker
