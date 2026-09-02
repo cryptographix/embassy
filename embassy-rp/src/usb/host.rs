@@ -203,6 +203,8 @@ pub struct HostState {
     current_channel: AtomicUsize,
     /// Bitset of allocated interrupt pipes.
     allocated_pipes: AtomicU16,
+    /// Pipes whose cancelled transfer moved a packet without advancing `pid`.
+    interrupt_toggle_owed: AtomicU16,
     /// Bitset of allocated EPX pipes, indexed by `Channel::index - EP_COUNT`.
     allocated_epx: AtomicU16,
     /// One waiter per EPX pipe. Completion is routed to the pipe that owns EPX,
@@ -226,6 +228,7 @@ impl HostState {
         Self {
             current_channel: AtomicUsize::new(0),
             allocated_pipes: AtomicU16::new(0),
+            interrupt_toggle_owed: AtomicU16::new(0),
             allocated_epx: AtomicU16::new(0),
             epx_wakers: [const { AtomicWaker::new() }; EPX_MAX_PIPES],
             used_blocks: critical_section::Mutex::new(Cell::new(0)),
@@ -236,6 +239,7 @@ impl HostState {
     fn reset(&self) {
         self.current_channel.store(0, Ordering::Relaxed);
         self.allocated_pipes.store(0, Ordering::Relaxed);
+        self.interrupt_toggle_owed.store(0, Ordering::Relaxed);
         self.allocated_epx.store(0, Ordering::Relaxed);
         critical_section::with(|cs| {
             *self.arbiter.borrow(cs).borrow_mut() = EpxArbiter::new();
@@ -623,6 +627,7 @@ struct TransactionGuard<T: SealedHostInstance> {
     state: &'static HostState,
     index: usize,
     interrupt: bool,
+    is_out: bool,
     ep_control: EpControlReg,
     buffer_control: BufferControlReg,
     transaction_active: bool,
@@ -632,19 +637,44 @@ struct TransactionGuard<T: SealedHostInstance> {
 impl<T: SealedHostInstance> TransactionGuard<T> {
     fn arm(&mut self) {
         self.transaction_active = true;
-        self.state.with_arbiter(|a| a.armed = true);
+        if !self.interrupt {
+            self.state.with_arbiter(|a| a.armed = true);
+        }
     }
 
     fn disarm(&mut self) {
         self.transaction_active = false;
-        self.state.with_arbiter(|a| a.armed = false);
+        if !self.interrupt {
+            self.state.with_arbiter(|a| a.armed = false);
+        }
     }
 }
 
 impl<T: SealedHostInstance> Drop for TransactionGuard<T> {
     fn drop(&mut self) {
-        // Dedicated interrupt endpoints belong to the pipe
         if self.interrupt {
+            if !self.transaction_active {
+                return;
+            }
+
+            // Stop polling before inspecting whether the cancelled packet moved.
+            let regs = T::regs();
+            regs.int_ep_ctrl().modify(|w| {
+                w.set_int_ep_active(w.int_ep_active() & !(1 << (self.index - 1)));
+            });
+
+            let bc = self.buffer_control.read();
+            let moved = !bc.available(0) && if self.is_out { !bc.full(0) } else { bc.full(0) };
+            if moved {
+                let owed = &self.state.interrupt_toggle_owed;
+                owed.store(owed.load(Ordering::Relaxed) | (1 << self.index), Ordering::Relaxed);
+            }
+
+            self.buffer_control.modify(|w| {
+                w.set_available(0, false);
+                w.set_full(0, false);
+            });
+            regs.buff_status().write_clear(|w| w.0 = 0b11 << (self.index * 2));
             return;
         }
 
@@ -952,6 +982,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             state: T::host_state(),
             index: self.index,
             interrupt: Self::is_interrupt(),
+            is_out: D::is_out(),
             ep_control: self.ep_control(),
             buffer_control: self.buffer_control(),
             transaction_active: false,
@@ -1089,6 +1120,16 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         });
 
         chunk.len()
+    }
+
+    /// Apply a toggle consumed by a packet that completed during cancellation.
+    fn settle_owed_toggle(&mut self) {
+        let owed = &T::host_state().interrupt_toggle_owed;
+        let bit = 1u16 << self.index;
+        if owed.load(Ordering::Relaxed) & bit != 0 {
+            owed.store(owed.load(Ordering::Relaxed) & !bit, Ordering::Relaxed);
+            self.advance_pid();
+        }
     }
 
     fn advance_pid(&mut self) {
@@ -1255,10 +1296,13 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
         D: pipe::IsIn,
     {
         // An interrupt pipe owns its endpoint for the whole read.
-        let _interrupt_guard = if Self::is_interrupt() {
+        let mut interrupt_guard = if Self::is_interrupt() {
             self.wait_ready_for_transaction().await;
             self.set_current();
-            Some(self.transaction_guard())
+            self.settle_owed_toggle();
+            let mut guard = self.transaction_guard();
+            guard.arm();
+            Some(guard)
         } else {
             None
         };
@@ -1306,6 +1350,9 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
             if Self::is_interrupt() {
                 self.advance_pid();
                 self.interrupt_reload();
+                if let Some(guard) = interrupt_guard.as_mut() {
+                    guard.disarm();
+                }
                 break Ok(count);
             }
 
@@ -1327,7 +1374,9 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
         if Self::is_interrupt() {
             self.wait_ready_for_transaction().await;
             self.set_current();
-            let _interrupt_guard = self.transaction_guard();
+            self.settle_owed_toggle();
+            let mut guard = self.transaction_guard();
+            guard.arm();
 
             // Run once so an empty buffer sends a ZLP.
             let mut count = 0;
@@ -1351,6 +1400,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
                 self.advance_pid();
             }
 
+            guard.disarm();
             return Ok(());
         }
 
@@ -1410,7 +1460,12 @@ impl<'d, T: SealedHostInstance, E, D> Drop for Channel<'d, T, E, D> {
             regs.buff_status().write_clear(|w| w.0 = 0b11 << (self.index * 2));
 
             let state = T::host_state();
+            let bit = 1u16 << self.index;
             critical_section::with(|_| {
+                state.interrupt_toggle_owed.store(
+                    state.interrupt_toggle_owed.load(Ordering::Relaxed) & !bit,
+                    Ordering::Relaxed,
+                );
                 let pipes = &state.allocated_pipes;
                 pipes.store(pipes.load(Ordering::Relaxed) & !(1 << self.index), Ordering::Relaxed);
             });
