@@ -754,8 +754,8 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
             let reg = self.buffer_control().read();
 
-            // If waiting on current tx, clear interrupts
-            if self.is_ready_for_transaction() {
+            // A dedicated endpoint is always ours; only EPX needs the ownership test.
+            if Self::is_interrupt() || self.can_run_epx_transaction() {
                 self.clear_sie_status();
             }
 
@@ -768,27 +768,22 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         .await
     }
 
-    /// Is hardware configured to perform transaction with this buffer
-    /// Always true for INTERRUPT channel
-    fn is_ready_for_transaction(&self) -> bool {
-        if Self::is_interrupt() {
-            true
-        } else {
-            let state = T::host_state();
-            let sel = state.current_channel.load(Ordering::Relaxed);
-            if sel == self.index {
-                return true;
-            }
-            if sel != 0 {
-                return false;
-            }
+    /// Do we hold the shared endpoint, or may we take it next?
+    fn can_run_epx_transaction(&self) -> bool {
+        let state = T::host_state();
+        let sel = state.current_channel.load(Ordering::Relaxed);
+        if sel == self.index {
+            return true;
+        }
+        if sel != 0 {
+            return false;
+        }
 
-            // EPX is free: take it only when the queue says it is our turn, so a
-            // pipe that keeps re-arming cannot monopolise the endpoint.
-            match state.epx_turn() {
-                Some(slot) => slot == self.epx_slot(),
-                None => true,
-            }
+        // EPX is free: take it only when the queue says it is our turn, so a
+        // pipe that keeps re-arming cannot monopolise the endpoint.
+        match state.epx_turn() {
+            Some(slot) => slot == self.epx_slot(),
+            None => true,
         }
     }
 
@@ -801,7 +796,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         poll_fn(|cx| {
             self.waker().register(cx.waker());
 
-            if self.is_ready_for_transaction() {
+            if self.can_run_epx_transaction() {
                 #[cfg(feature = "_rp235x")]
                 if !Self::is_interrupt() {
                     disarm_epx_yield::<T>();
