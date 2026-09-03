@@ -1117,6 +1117,29 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         }
     }
 
+    /// Write over EPX until the caller's buffer is drained.
+    async fn epx_write(&mut self, buf: &[u8], ensure_transaction_end: bool) -> Result<(), PipeError> {
+        let mut count = 0;
+        loop {
+            trace!("CHANNEL {} START WRITE", self.index);
+            let packet = self.transfer_out_packet(&buf[count..], self.pid).await?;
+            self.advance_pid();
+
+            trace!("WRITE DONE, tx_len = {}", packet);
+            count += packet;
+
+            if count == buf.len() {
+                if packet == self.max_packet_size as usize && ensure_transaction_end {
+                    trace!("CHANNEL {} START ZLP WRITE", self.index);
+                    self.transfer_out_packet(&[], self.pid).await?;
+                    self.advance_pid();
+                    trace!("ZLP WRITE DONE");
+                }
+                return Ok(());
+            }
+        }
+    }
+
     fn advance_pid(&mut self) {
         if E::ep_type() != EndpointType::Isochronous {
             self.pid = !self.pid;
@@ -1289,29 +1312,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
     where
         D: pipe::IsOut,
     {
-        let mut count = 0;
-
-        let res = loop {
-            trace!("CHANNEL {} START WRITE", self.index);
-            let packet = self.transfer_out_packet(&buf[count..], self.pid).await?;
-            self.advance_pid();
-
-            trace!("WRITE DONE, tx_len = {}", packet);
-
-            count += packet;
-
-            if count == buf.len() {
-                if packet == self.max_packet_size as usize && ensure_transaction_end {
-                    trace!("CHANNEL {} START ZLP WRITE", self.index);
-                    self.transfer_out_packet(&[], self.pid).await?;
-                    self.advance_pid();
-                    trace!("ZLP WRITE DONE");
-                }
-                break Ok(());
-            }
-        };
-
-        res
+        self.epx_write(buf, ensure_transaction_end).await
     }
 
     fn set_timeout(&mut self, timeout: TimeoutConfig) {
