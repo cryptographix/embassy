@@ -614,12 +614,24 @@ impl<'d, T: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, T> {
     ) -> Result<Self::Pipe<E, D>, HostError> {
         let state = T::host_state();
         let pre = split_to_pre(split);
+
         if E::ep_type() == EndpointType::Interrupt {
+            // Dedicated interrupt pipes have one fixed block.
+            if endpoint.max_packet_size == 0 || endpoint.max_packet_size as usize > EPX_BLOCK_SIZE {
+                return Err(HostError::InvalidDescriptor);
+            }
             let index = state.interrupt_pipes.allocate()?;
             // Fixed layout: pipe index 1..EP_COUNT maps to block 0..EP_COUNT-1.
             let addr = DPRAM_DATA_OFFSET + (index as u16 - 1) * EPX_BLOCK_SIZE as u16;
 
-            Ok(Channel::new(index, addr, 64, endpoint, dev_addr, pre))
+            Ok(Channel::new(
+                index,
+                addr,
+                EPX_BLOCK_SIZE as u16,
+                endpoint,
+                dev_addr,
+                pre,
+            ))
         } else {
             let (index, addr, len) = state.epx.allocate(endpoint.max_packet_size)?;
 
