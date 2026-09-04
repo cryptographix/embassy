@@ -3,9 +3,9 @@
 use core::num::NonZeroU8;
 
 use embassy_usb::control::Request;
-use embassy_usb_driver::Direction;
 pub use embassy_usb_driver::host::pipe;
-use embassy_usb_driver::host::{HostError, UsbPipe};
+use embassy_usb_driver::host::{HostError, PipeError, UsbPipe};
+use embassy_usb_driver::{Direction, EndpointAddress};
 
 use crate::descriptor::{USBDescriptor, descriptor_type};
 
@@ -297,6 +297,36 @@ impl SetupPacket {
         }
     }
 
+    /// Build a GET_STATUS(Endpoint) SETUP packet.
+    pub fn get_endpoint_status(endpoint: EndpointAddress) -> Self {
+        Self {
+            request_type: RequestType {
+                direction: Direction::In,
+                control_type: ControlType::Standard,
+                recipient: Recipient::Endpoint,
+            },
+            request: Request::GET_STATUS,
+            value: 0,
+            index: u8::from(endpoint) as u16,
+            length: 2,
+        }
+    }
+
+    /// Build a CLEAR_FEATURE(ENDPOINT_HALT) SETUP packet.
+    pub fn clear_endpoint_halt(endpoint: EndpointAddress) -> Self {
+        Self {
+            request_type: RequestType {
+                direction: Direction::Out,
+                control_type: ControlType::Standard,
+                recipient: Recipient::Endpoint,
+            },
+            request: Request::CLEAR_FEATURE,
+            value: Request::FEATURE_ENDPOINT_HALT,
+            index: u8::from(endpoint) as u16,
+            length: 0,
+        }
+    }
+
     /// Build a class-specific interface request SETUP packet, host-to-device.
     ///
     /// Pass `length = 0` for requests with no data stage.
@@ -364,6 +394,22 @@ impl SetupPacket {
 
 /// Extension trait providing higher-level control request methods on a USB control pipe.
 pub trait ControlPipeExt<D: pipe::Direction>: UsbPipe<pipe::Control, D> {
+    /// Return whether a bulk or interrupt endpoint is halted.
+    ///
+    /// Use [`clear_endpoint_halt`] to recover a halted endpoint.
+    async fn endpoint_is_halted(&mut self, endpoint: EndpointAddress) -> Result<bool, PipeError>
+    where
+        D: pipe::IsIn,
+    {
+        let setup = SetupPacket::get_endpoint_status(endpoint);
+        let mut status = [0; 2];
+        let len = self.control_in(&setup.to_bytes(), &mut status).await?;
+        if len != status.len() {
+            return Err(PipeError::BadResponse);
+        }
+        Ok(u16::from_le_bytes(status) & 1 != 0)
+    }
+
     /// Request and parse a fixed-size descriptor.
     async fn request_descriptor<T: USBDescriptor, const SIZE: usize>(
         &mut self,
@@ -463,6 +509,26 @@ pub trait ControlPipeExt<D: pipe::Direction>: UsbPipe<pipe::Control, D> {
 
 impl<D: pipe::Direction, C> ControlPipeExt<D> for C where C: UsbPipe<pipe::Control, D> {}
 
+/// Clear an endpoint halt and reset its host-side data toggle.
+///
+/// Cancel any pending transfer on `endpoint` before calling this function.
+pub async fn clear_endpoint_halt<C, P, T, D>(
+    control: &mut C,
+    pipe: &mut P,
+    endpoint: EndpointAddress,
+) -> Result<(), PipeError>
+where
+    C: UsbPipe<pipe::Control, pipe::InOut>,
+    P: UsbPipe<T, D>,
+    T: pipe::Type + pipe::IsBulkOrInterrupt,
+    D: pipe::Direction,
+{
+    let setup = SetupPacket::clear_endpoint_halt(endpoint);
+    control.control_out(&setup.to_bytes(), &[]).await?;
+    pipe.reset_data_toggle();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +562,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn endpoint_halt_setup_packets() {
+        let endpoint = EndpointAddress::from_parts(1, Direction::In);
+        assert_eq!(
+            SetupPacket::get_endpoint_status(endpoint).to_bytes(),
+            [0x82, 0, 0, 0, 0x81, 0, 2, 0]
+        );
+        assert_eq!(
+            SetupPacket::clear_endpoint_halt(endpoint).to_bytes(),
+            [0x02, 1, 0, 0, 0x81, 0, 0, 0]
+        );
     }
 }
