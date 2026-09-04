@@ -850,25 +850,38 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         E::ep_type() == EndpointType::Interrupt
     }
 
-    /// Wait for buffer to be available
-    /// Returns stall status
-    async fn wait_available(&self) -> bool {
+    /// Wait for the controller to release a dedicated interrupt endpoint's buffer.
+    async fn wait_interrupt_buffer(&self) {
         trace!("CHANNEL {} WAIT AVAILABLE", self.index);
         poll_fn(|cx| {
             // Both IN and OUT endpoints use IN registers on rp2040 in host mode
             self.waker().register(cx.waker());
 
             let reg = self.buffer_control().read();
+            T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
 
-            // If waiting on current tx, clear interrupts
-            if self.is_ready_for_transaction() {
-                self.clear_sie_status();
-            }
-
-            // FIXME: Stall derived from other place
             match reg.available(0) {
                 true => Poll::Pending,
-                false => Poll::Ready(false),
+                false => Poll::Ready(()),
+            }
+        })
+        .await
+    }
+
+    /// Wait for this pipe to own EPX and for the controller to release its buffer.
+    async fn wait_epx_buffer(&self) {
+        trace!("CHANNEL {} WAIT AVAILABLE", self.index);
+        poll_fn(|cx| {
+            self.waker().register(cx.waker());
+
+            let reg = self.buffer_control().read();
+            if self.is_ready_for_transaction() {
+                T::regs().buff_status().write_clear(|w| w.0 = 0b11);
+            }
+
+            match reg.available(0) {
+                true => Poll::Pending,
+                false => Poll::Ready(()),
             }
         })
         .await
@@ -899,19 +912,18 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     }
 
     async fn wait_ready_for_transaction(&self) {
+        debug_assert!(!Self::is_interrupt());
         trace!("CHANNEL {} WAIT READY", self.index);
 
         // Join the queue for EPX. Dropped with this future, cancelled or not.
-        let _ticket = (!Self::is_interrupt()).then(|| WaitTicket::<T>::new(self.epx_slot()));
+        let _ticket = WaitTicket::<T>::new(self.epx_slot());
         // Wait for other transaction end
         poll_fn(|cx| {
             self.waker().register(cx.waker());
 
             if self.is_ready_for_transaction() {
                 #[cfg(feature = "_rp235x")]
-                if !Self::is_interrupt() {
-                    disarm_epx_yield::<T>();
-                }
+                disarm_epx_yield::<T>();
 
                 return Poll::Ready(());
             }
@@ -924,7 +936,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         .await;
 
         // Once this pipe owns EPX, wait for its transfer buffer to be free.
-        self.wait_available().await;
+        self.wait_epx_buffer().await;
     }
 
     // FIXME: RX Timeout with LS device on hub
@@ -1146,7 +1158,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Read one packet from a dedicated interrupt endpoint.
     async fn interrupt_in_read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
-        self.wait_ready_for_transaction().await;
+        self.wait_interrupt_buffer().await;
         self.set_current();
         self.settle_interrupt_toggle();
         let mut guard = self.interrupt_transfer_guard();
@@ -1160,13 +1172,13 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             // Already armed, so the controller owns the buffer and may fill it at
             // any moment. Writing to it here would race that; just wait.
             trace!("CHANNEL {} WAIT FOR INTERRUPT", self.index);
-            self.wait_available().await;
+            self.wait_interrupt_buffer().await;
         } else {
             // Idle: not armed and holding nothing, so the controller cannot be
             // touching the buffer and it is safe to program.
             trace!("CHANNEL {} ARM INTERRUPT", self.index);
             self.interrupt_reload();
-            self.wait_available().await;
+            self.wait_interrupt_buffer().await;
         }
 
         let rx_len = self.buffer_control().read().length(0) as usize;
@@ -1184,7 +1196,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Write to a dedicated interrupt endpoint, one packet per poll.
     async fn interrupt_out_write(&mut self, buf: &[u8], ensure_transaction_end: bool) -> Result<(), PipeError> {
-        self.wait_ready_for_transaction().await;
+        self.wait_interrupt_buffer().await;
         self.set_current();
         self.settle_interrupt_toggle();
         let mut guard = self.interrupt_transfer_guard();
@@ -1196,7 +1208,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         loop {
             trace!("CHANNEL {} ARM INTERRUPT OUT", self.index);
             packet = self.interrupt_send(&buf[count..]);
-            self.wait_available().await;
+            self.wait_interrupt_buffer().await;
             self.advance_pid();
             count += packet;
             if count >= buf.len() {
@@ -1207,7 +1219,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         if ensure_transaction_end && packet == self.max_packet_size as usize {
             trace!("CHANNEL {} ARM INTERRUPT OUT ZLP", self.index);
             self.interrupt_send(&[]);
-            self.wait_available().await;
+            self.wait_interrupt_buffer().await;
             self.advance_pid();
         }
 
@@ -1280,15 +1292,6 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     fn advance_pid(&mut self) {
         if E::ep_type() != EndpointType::Isochronous {
             self.pid = !self.pid;
-        }
-    }
-
-    /// Clear buffer interrupt bit
-    fn clear_sie_status(&self) {
-        if Self::is_interrupt() {
-            T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
-        } else {
-            T::regs().buff_status().write_clear(|w| w.0 = 0b11);
         }
     }
 
