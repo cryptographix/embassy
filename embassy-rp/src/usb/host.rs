@@ -203,6 +203,10 @@ struct InterruptPipeState {
     allocated: AtomicU16,
     /// Pipes whose cancelled transfer completed before its data toggle was advanced.
     toggle_owed: AtomicU16,
+    /// Interrupt IN endpoints with a receive buffer armed.
+    armed_in: AtomicU16,
+    /// Interrupt IN endpoints charged with the SIE's global receive timeout.
+    timed_out: AtomicU16,
 }
 
 impl InterruptPipeState {
@@ -210,12 +214,16 @@ impl InterruptPipeState {
         Self {
             allocated: AtomicU16::new(0),
             toggle_owed: AtomicU16::new(0),
+            armed_in: AtomicU16::new(0),
+            timed_out: AtomicU16::new(0),
         }
     }
 
     fn reset(&self) {
         self.allocated.store(0, Ordering::Relaxed);
         self.toggle_owed.store(0, Ordering::Relaxed);
+        self.armed_in.store(0, Ordering::Relaxed);
+        self.timed_out.store(0, Ordering::Relaxed);
     }
 
     fn allocate(&self) -> Result<usize, HostError> {
@@ -236,7 +244,51 @@ impl InterruptPipeState {
             self.allocated.store(allocated & !bit, Ordering::Relaxed);
             let owed = self.toggle_owed.load(Ordering::Relaxed);
             self.toggle_owed.store(owed & !bit, Ordering::Relaxed);
+            let armed = self.armed_in.load(Ordering::Relaxed);
+            self.armed_in.store(armed & !bit, Ordering::Relaxed);
+            let timed_out = self.timed_out.load(Ordering::Relaxed);
+            self.timed_out.store(timed_out & !bit, Ordering::Relaxed);
         });
+    }
+
+    fn mark_armed_in(&self, index: usize) {
+        critical_section::with(|_| {
+            let armed = self.armed_in.load(Ordering::Relaxed);
+            self.armed_in.store(armed | (1 << index), Ordering::Relaxed);
+        });
+    }
+
+    fn mark_completed(&self, index: usize) {
+        critical_section::with(|_| {
+            let armed = self.armed_in.load(Ordering::Relaxed);
+            self.armed_in.store(armed & !(1 << index), Ordering::Relaxed);
+        });
+    }
+
+    /// Charge a global receive timeout to every interrupt IN endpoint that was armed.
+    /// The hardware does not identify which endpoint caused it.
+    fn record_timeout(&self) {
+        let candidates = critical_section::with(|_| {
+            let candidates = self.armed_in.load(Ordering::Relaxed);
+            let timed_out = self.timed_out.load(Ordering::Relaxed);
+            self.timed_out.store(timed_out | candidates, Ordering::Relaxed);
+            self.armed_in.store(0, Ordering::Relaxed);
+            candidates
+        });
+        for index in 1..EP_COUNT {
+            if candidates & (1 << index) != 0 {
+                EP_IN_WAKERS[index].wake();
+            }
+        }
+    }
+
+    fn take_timeout(&self, index: usize) -> bool {
+        critical_section::with(|_| {
+            let bit = 1 << index;
+            let timed_out = self.timed_out.load(Ordering::Relaxed);
+            self.timed_out.store(timed_out & !bit, Ordering::Relaxed);
+            timed_out & bit != 0
+        })
     }
 
     fn mark_toggle_owed(&self, index: usize) {
@@ -715,6 +767,7 @@ impl<T: SealedHostInstance> Drop for InterruptTransferGuard<T> {
 
         let buffer = self.buffer_control.read();
         let moved = !buffer.available(0) && if self.is_out { !buffer.full(0) } else { buffer.full(0) };
+        T::host_state().interrupt_pipes.mark_completed(self.index);
         if moved {
             T::host_state().interrupt_pipes.mark_toggle_owed(self.index);
         }
@@ -851,21 +904,58 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     }
 
     /// Wait for the controller to release a dedicated interrupt endpoint's buffer.
-    async fn wait_interrupt_buffer(&self) {
+    async fn wait_interrupt_buffer(&self) -> Result<(), PipeError> {
         trace!("CHANNEL {} WAIT AVAILABLE", self.index);
-        poll_fn(|cx| {
-            // Both IN and OUT endpoints use IN registers on rp2040 in host mode
-            self.waker().register(cx.waker());
+        if D::is_out() {
+            return poll_fn(|cx| self.poll_interrupt_buffer(cx)).await;
+        }
 
-            let reg = self.buffer_control().read();
-            T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
-
-            match reg.available(0) {
-                true => Poll::Pending,
-                false => Poll::Ready(()),
+        // RX timeout is not delivered through INTS, so sample its global status bit at
+        // the endpoint's polling interval.
+        let interval = embassy_time::Duration::from_millis(self.interval.max(1) as u64);
+        loop {
+            match embassy_time::with_timeout(interval, poll_fn(|cx| self.poll_interrupt_buffer(cx))).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    let state = T::host_state();
+                    // Only attribute the global status while the shared endpoint is idle.
+                    let epx_idle = state.current_channel.load(Ordering::Acquire) == 0
+                        && !state.with_arbiter(|arbiter| arbiter.armed);
+                    if epx_idle && T::regs().sie_status().read().rx_timeout() {
+                        T::regs().sie_status().write_clear(|w| w.set_rx_timeout(true));
+                        state.interrupt_pipes.record_timeout();
+                    }
+                }
             }
-        })
-        .await
+        }
+    }
+
+    fn poll_interrupt_buffer(&self, cx: &mut core::task::Context<'_>) -> Poll<Result<(), PipeError>> {
+        // Both directions use the IN endpoint registers in host mode.
+        self.waker().register(cx.waker());
+
+        if T::host_state().interrupt_pipes.take_timeout(self.index) {
+            T::regs().int_ep_ctrl().modify(|w| {
+                w.set_int_ep_active(w.int_ep_active() & !(1 << (self.index - 1)));
+            });
+            self.buffer_control().modify(|w| {
+                w.set_available(0, false);
+                w.set_full(0, false);
+            });
+            T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
+            return Poll::Ready(Err(PipeError::Timeout));
+        }
+
+        let reg = self.buffer_control().read();
+        T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
+
+        match reg.available(0) {
+            true => Poll::Pending,
+            false => {
+                T::host_state().interrupt_pipes.mark_completed(self.index);
+                Poll::Ready(Ok(()))
+            }
+        }
     }
 
     /// Wait for this pipe to own EPX and for the controller to release its buffer.
@@ -1128,6 +1218,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         });
 
         cortex_m::asm::delay(USB_CLOCK_DELAY_CYCLES);
+        T::host_state().interrupt_pipes.mark_armed_in(self.index);
         T::regs().int_ep_ctrl().modify(|w| {
             w.set_int_ep_active(w.int_ep_active() | 1 << (self.index - 1));
         });
@@ -1158,7 +1249,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Read one packet from a dedicated interrupt endpoint.
     async fn interrupt_in_read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
-        self.wait_interrupt_buffer().await;
+        self.wait_interrupt_buffer().await?;
         self.set_current();
         self.settle_interrupt_toggle();
         let mut guard = self.interrupt_transfer_guard();
@@ -1172,13 +1263,13 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             // Already armed, so the controller owns the buffer and may fill it at
             // any moment. Writing to it here would race that; just wait.
             trace!("CHANNEL {} WAIT FOR INTERRUPT", self.index);
-            self.wait_interrupt_buffer().await;
+            self.wait_interrupt_buffer().await?;
         } else {
             // Idle: not armed and holding nothing, so the controller cannot be
             // touching the buffer and it is safe to program.
             trace!("CHANNEL {} ARM INTERRUPT", self.index);
             self.interrupt_reload();
-            self.wait_interrupt_buffer().await;
+            self.wait_interrupt_buffer().await?;
         }
 
         let rx_len = self.buffer_control().read().length(0) as usize;
@@ -1196,7 +1287,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Write to a dedicated interrupt endpoint, one packet per poll.
     async fn interrupt_out_write(&mut self, buf: &[u8], ensure_transaction_end: bool) -> Result<(), PipeError> {
-        self.wait_interrupt_buffer().await;
+        self.wait_interrupt_buffer().await?;
         self.set_current();
         self.settle_interrupt_toggle();
         let mut guard = self.interrupt_transfer_guard();
@@ -1208,7 +1299,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         loop {
             trace!("CHANNEL {} ARM INTERRUPT OUT", self.index);
             packet = self.interrupt_send(&buf[count..]);
-            self.wait_interrupt_buffer().await;
+            self.wait_interrupt_buffer().await?;
             self.advance_pid();
             count += packet;
             if count >= buf.len() {
@@ -1219,7 +1310,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         if ensure_transaction_end && packet == self.max_packet_size as usize {
             trace!("CHANNEL {} ARM INTERRUPT OUT ZLP", self.index);
             self.interrupt_send(&[]);
-            self.wait_interrupt_buffer().await;
+            self.wait_interrupt_buffer().await?;
             self.advance_pid();
         }
 
@@ -1888,6 +1979,7 @@ impl<T: SealedHostInstance> interrupt::typelevel::Handler<T::Interrupt> for Inte
                 for n in 1..EP_COUNT {
                     if status & (0b11 << (n * 2)) != 0 {
                         regs.buff_status().write_clear(|w| w.0 = 0b11 << (n * 2));
+                        T::host_state().interrupt_pipes.mark_completed(n);
                         trace!("USB IRQ: Interrupt EP {}", n);
                         EP_IN_WAKERS[n].wake();
                     }
