@@ -254,6 +254,13 @@ impl InterruptPipeState {
             owed & bit != 0
         })
     }
+
+    fn clear_toggle_owed(&self, index: usize) {
+        critical_section::with(|_| {
+            let owed = self.toggle_owed.load(Ordering::Relaxed);
+            self.toggle_owed.store(owed & !(1 << index), Ordering::Relaxed);
+        });
+    }
 }
 
 /// Per-instance state shared between [`Driver`], [`Allocator`] and [`Channel`].
@@ -1512,6 +1519,9 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D>
 
     fn reset_data_toggle(&mut self) {
         self.pid = false;
+        if Self::is_interrupt() {
+            T::host_state().interrupt_pipes.clear_toggle_owed(self.index);
+        }
     }
 }
 
