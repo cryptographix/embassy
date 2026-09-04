@@ -201,8 +201,38 @@ impl EpxArbiter {
 ///
 /// Each pipe owns its endpoint outright, so nothing here arbitrates.
 struct InterruptPipeState {
-    /// Bitset of allocated interrupt pipes.
+    /// Bitset of allocated endpoint indices (1..EP_COUNT).
     allocated_pipes: AtomicU16,
+}
+
+impl InterruptPipeState {
+    const fn new() -> Self {
+        Self {
+            allocated_pipes: AtomicU16::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.allocated_pipes.store(0, Ordering::Relaxed);
+    }
+
+    fn allocate(&self) -> Result<usize, HostError> {
+        critical_section::with(|_| {
+            let allocated = self.allocated_pipes.load(Ordering::Relaxed);
+            let index = (1..EP_COUNT)
+                .find(|index| allocated & (1 << index) == 0)
+                .ok_or(HostError::OutOfPipes)?;
+            self.allocated_pipes.store(allocated | (1 << index), Ordering::Relaxed);
+            Ok(index)
+        })
+    }
+
+    fn free(&self, index: usize) {
+        critical_section::with(|_| {
+            let allocated = self.allocated_pipes.load(Ordering::Relaxed);
+            self.allocated_pipes.store(allocated & !(1 << index), Ordering::Relaxed);
+        });
+    }
 }
 
 /// Per-instance state shared between [`Driver`], [`Allocator`] and [`Channel`].
@@ -216,15 +246,13 @@ impl HostState {
     pub const fn new() -> Self {
         Self {
             epx: EpxState::new(),
-            interrupt_pipes: InterruptPipeState {
-                allocated_pipes: AtomicU16::new(0),
-            },
+            interrupt_pipes: InterruptPipeState::new(),
         }
     }
 
     fn reset(&self) {
         self.epx.reset();
-        self.interrupt_pipes.allocated_pipes.store(0, Ordering::Relaxed);
+        self.interrupt_pipes.reset();
     }
 }
 
@@ -356,7 +384,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             regs.sie_status().write_clear(|w| w.set_trans_complete(true));
             TransactionStatus::Complete
         } else if !setup && !yield_epx::<T>(self.index) {
-            T::host_state().epx.take_epx_completed(self.epx_slot());
+            T::host_state().epx.take_completed(self.epx_slot());
             TransactionStatus::Complete
         } else {
             // Clear global status so the next pipe cannot consume this transaction's result.
@@ -469,8 +497,8 @@ fn record_epx_error<T: SealedHostInstance>(error: EpxError) {
 
     state
         .epx
-        .mark_epx_error(state.epx.current_channel.load(Ordering::Acquire), error);
-    state.epx.wake_current_epx();
+        .mark_error(state.epx.current_channel.load(Ordering::Acquire), error);
+    state.epx.wake_current();
 }
 
 /// Hand EPX from the pipe at `index` to whoever is queued for it. Returns `true` when the
@@ -488,17 +516,17 @@ fn yield_epx<T: SealedHostInstance>(index: usize) -> bool {
     if completed {
         // The stop suppressed `trans_complete`, so report it in software and let the
         // owner collect its packet. It keeps EPX until the transfer finishes.
-        state.epx.mark_epx_completed(index);
-        state.epx.wake_current_epx();
+        state.epx.mark_completed(index);
+        state.epx.wake_current();
         return false;
     }
 
-    state.epx.mark_epx_yielded(index);
+    state.epx.mark_yielded(index);
 
     // Nothing was transferred. Revoke the buffer before another pipe installs its own.
     buf_ctrl.modify(|w| w.set_available(0, false));
     state.epx.current_channel.store(0, Ordering::Release);
-    state.epx.wake_all_epx();
+    state.epx.wake_all();
 
     true
 }
@@ -530,7 +558,7 @@ impl<T: SealedHostInstance> Drop for WaitTicket<T> {
 impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T, E, D> {
     /// Whether this pipe was made to yield EPX since the last check.
     fn take_nak_yield(&self) -> bool {
-        T::host_state().epx.take_epx_yielded(self.epx_slot())
+        T::host_state().epx.take_yielded(self.epx_slot())
     }
 
     fn buffer_control(&self) -> BufferControlReg {
@@ -586,7 +614,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             EP_IN_WAKERS[self.index].register(cx.waker());
 
             let reg = self.buffer_control().read();
-            self.clear_sie_status();
+            T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
             if reg.available(0) {
                 Poll::Pending
             } else {
@@ -597,7 +625,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     }
 
     /// Do we hold the shared endpoint, or may we take it next?
-    fn can_run_epx_transaction(&self) -> bool {
+    fn can_run_transaction(&self) -> bool {
         let state = T::host_state();
         let sel = state.epx.current_channel.load(Ordering::Relaxed);
         if sel == self.index {
@@ -609,7 +637,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
         // EPX is free: take it only when the queue says it is our turn, so a
         // pipe that keeps re-arming cannot monopolise the endpoint.
-        match state.epx.epx_turn() {
+        match state.epx.turn() {
             Some(slot) => slot == self.epx_slot(),
             None => true,
         }
@@ -625,9 +653,9 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         {
             let _ticket = WaitTicket::<T>::new(self.epx_slot());
             poll_fn(|cx| {
-                self.epx_waker().register(cx.waker());
+                self.waker().register(cx.waker());
 
-                if self.can_run_epx_transaction() {
+                if self.can_run_transaction() {
                     #[cfg(feature = "_rp235x")]
                     disarm_epx_yield::<T>();
 
@@ -673,12 +701,12 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
         trace!("CHANNEL {} WAIT TRANSACTION", self.index);
         let res = poll_fn(|cx| {
-            self.epx_waker().register(cx.waker());
+            self.waker().register(cx.waker());
 
-            if let Some(error) = T::host_state().epx.take_epx_error(self.epx_slot()) {
+            if let Some(error) = T::host_state().epx.take_error(self.epx_slot()) {
                 return Poll::Ready(Err(error));
             }
-            if T::host_state().epx.take_epx_completed(self.epx_slot()) {
+            if T::host_state().epx.take_completed(self.epx_slot()) {
                 return Poll::Ready(Ok(TransactionStatus::Complete));
             }
             if self.take_nak_yield() {
@@ -924,15 +952,6 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         }
     }
 
-    /// Clear buffer interrupt bit
-    fn clear_sie_status(&self) {
-        if Self::is_interrupt_in() {
-            T::regs().buff_status().write_clear(|w| w.0 = 0b11 << self.index * 2);
-        } else {
-            T::regs().buff_status().write_clear(|w| w.0 = 0b11);
-        }
-    }
-
     /// Claim EPX and run one transaction on it. `arm` programs the buffer once this
     /// pipe owns the endpoint.
     async fn run_epx_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
@@ -1123,28 +1142,9 @@ impl<'d, T: SealedHostInstance, E, D> Drop for Channel<'d, T, E, D> {
             dpram.ep_in_buffer_control(self.index).write(|w| w.0 = 0);
             regs.buff_status().write_clear(|w| w.0 = 0b11 << (self.index * 2));
 
-            let state = T::host_state();
-            critical_section::with(|_| {
-                let pipes = &state.interrupt_pipes.allocated_pipes;
-                pipes.store(pipes.load(Ordering::Relaxed) & !(1 << self.index), Ordering::Relaxed);
-            });
+            T::host_state().interrupt_pipes.free(self.index);
         } else {
-            let state = T::host_state();
-            // Return the EPX buffer and the pipe slot to the pool.
-            free_epx_mem(state, self.buf.addr, self.buf.len);
-            state.epx.discard_epx_outcome(self.epx_slot());
-            critical_section::with(|_| {
-                let epx = &state.epx.allocated_epx;
-                epx.store(
-                    epx.load(Ordering::Relaxed) & !(1 << (self.epx_slot())),
-                    Ordering::Relaxed,
-                );
-            });
-            debug!(
-                "EPX pipe FREE  slot {} (bitset {:04x})",
-                self.epx_slot(),
-                state.epx.allocated_epx.load(Ordering::Relaxed)
-            );
+            T::host_state().epx.free(self.epx_slot(), self.buf.addr, self.buf.len);
         }
     }
 }
@@ -1174,14 +1174,14 @@ fn block_mask(start: usize, blocks: usize) -> u64 {
 
 /// Allocate `len` bytes of EPX buffer memory, returning its [`EP_MEMORY`]-relative byte address.
 /// First-fit over contiguous free blocks.
-fn alloc_epx_mem(state: &HostState, len: u16) -> Result<u16, ()> {
+fn alloc_epx_mem(state: &EpxState, len: u16) -> Result<u16, ()> {
     let blocks = blocks_for(len);
     if blocks == 0 || blocks > EPX_NUM_BLOCKS {
         error!("EPX buffer request of {} bytes is too large", len);
         return Err(());
     }
     critical_section::with(|cs| {
-        let used_blocks = state.epx.used_blocks.borrow(cs);
+        let used_blocks = state.used_blocks.borrow(cs);
         let used = used_blocks.get();
         for start in 0..=(EPX_NUM_BLOCKS - blocks) {
             let mask = block_mask(start, blocks);
@@ -1196,12 +1196,12 @@ fn alloc_epx_mem(state: &HostState, len: u16) -> Result<u16, ()> {
 }
 
 /// Free EPX buffer memory previously returned by [`alloc_epx_mem`].
-fn free_epx_mem(state: &HostState, addr: u16, len: u16) {
+fn free_epx_mem(state: &EpxState, addr: u16, len: u16) {
     let blocks = blocks_for(len);
     let start = (addr - EPX_BUFFER_OFFSET) as usize / EPX_BLOCK_SIZE;
     let mask = block_mask(start, blocks);
     critical_section::with(|cs| {
-        let used_blocks = state.epx.used_blocks.borrow(cs);
+        let used_blocks = state.used_blocks.borrow(cs);
         used_blocks.set(used_blocks.get() & !mask);
     });
 }
@@ -1214,10 +1214,10 @@ struct EpxState {
     /// Current channel with ongoing non-interrupt transfer. `0` means None.
     current_channel: AtomicUsize,
     /// Bitset of allocated EPX pipes, indexed by `Channel::index - EP_COUNT`.
-    allocated_epx: AtomicU16,
+    allocated_slots: AtomicU16,
     /// One waiter per EPX pipe. Completion is routed to the pipe that owns EPX,
     /// while releasing it wakes every contender.
-    epx_wakers: [AtomicWaker; EPX_MAX_PIPES],
+    wakers: [AtomicWaker; EPX_MAX_PIPES],
     /// Bitmap of used EPX buffer blocks, one bit per [`EPX_BLOCK_SIZE`] block.
     used_blocks: critical_section::Mutex<Cell<u64>>,
     /// One lock keeps multi-field decisions consistent; it also masks the interrupt, so a
@@ -1234,8 +1234,8 @@ impl EpxState {
     const fn new() -> Self {
         Self {
             current_channel: AtomicUsize::new(0),
-            allocated_epx: AtomicU16::new(0),
-            epx_wakers: [const { AtomicWaker::new() }; EPX_MAX_PIPES],
+            allocated_slots: AtomicU16::new(0),
+            wakers: [const { AtomicWaker::new() }; EPX_MAX_PIPES],
             used_blocks: critical_section::Mutex::new(Cell::new(0)),
             arbiter: critical_section::Mutex::new(RefCell::new(EpxArbiter::new())),
         }
@@ -1243,79 +1243,129 @@ impl EpxState {
 
     fn reset(&self) {
         self.current_channel.store(0, Ordering::Relaxed);
-        self.allocated_epx.store(0, Ordering::Relaxed);
+        self.allocated_slots.store(0, Ordering::Relaxed);
         critical_section::with(|cs| {
             *self.arbiter.borrow(cs).borrow_mut() = EpxArbiter::new();
             self.used_blocks.borrow(cs).set(0);
         });
     }
 
-    /// Slot of an EPX pipe in [`EpxState::epx_wakers`], or `None` for the idle
+    fn allocate(&self, max_packet_size: u16) -> Result<(usize, u16, u16), HostError> {
+        let slot = critical_section::with(|_| {
+            let allocated = self.allocated_slots.load(Ordering::Relaxed);
+            let slot = allocated.trailing_ones() as usize;
+            if slot >= EPX_MAX_PIPES {
+                return Err(HostError::OutOfPipes);
+            }
+            self.allocated_slots.store(allocated | (1 << slot), Ordering::Relaxed);
+            Ok(slot)
+        })?;
+
+        // A parked transfer keeps its buffer while another pipe owns EPX.
+        let len = (blocks_for(max_packet_size) * EPX_BLOCK_SIZE) as u16;
+        let addr = match alloc_epx_mem(self, len) {
+            Ok(addr) => addr,
+            Err(()) => {
+                // Hand the slot back or repeated buffer failures exhaust the pipe pool.
+                critical_section::with(|_| {
+                    let allocated = self.allocated_slots.load(Ordering::Relaxed);
+                    self.allocated_slots.store(allocated & !(1 << slot), Ordering::Relaxed);
+                });
+                return Err(HostError::InsufficientMemory);
+            }
+        };
+
+        debug!(
+            "EPX pipe ALLOC slot {} (bitset {:04x}) buf {:#x}+{}",
+            slot,
+            self.allocated_slots.load(Ordering::Relaxed),
+            addr,
+            len
+        );
+        Ok((EP_COUNT + slot, addr, len))
+    }
+
+    fn free(&self, slot: usize, addr: u16, len: u16) {
+        debug_assert!(slot < EPX_MAX_PIPES);
+        free_epx_mem(self, addr, len);
+        self.discard_outcome(slot);
+        critical_section::with(|_| {
+            let allocated = self.allocated_slots.load(Ordering::Relaxed);
+            self.allocated_slots.store(allocated & !(1 << slot), Ordering::Relaxed);
+        });
+        debug!(
+            "EPX pipe FREE  slot {} (bitset {:04x})",
+            slot,
+            self.allocated_slots.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Slot of an EPX pipe in [`EpxState::wakers`], or `None` for the idle
     /// sentinel and for interrupt pipes.
-    fn epx_slot(index: usize) -> Option<usize> {
+    fn slot(index: usize) -> Option<usize> {
         index.checked_sub(EP_COUNT).filter(|slot| *slot < EPX_MAX_PIPES)
     }
 
     /// Wake the pipe currently holding EPX.
-    fn wake_current_epx(&self) {
-        if let Some(slot) = Self::epx_slot(self.current_channel.load(Ordering::Acquire)) {
-            self.epx_wakers[slot].wake();
+    fn wake_current(&self) {
+        if let Some(slot) = Self::slot(self.current_channel.load(Ordering::Acquire)) {
+            self.wakers[slot].wake();
         }
     }
 
     /// Wake every allocated EPX pipe, so whoever is queued can claim EPX.
-    fn wake_all_epx(&self) {
-        let allocated = self.allocated_epx.load(Ordering::Acquire);
+    fn wake_all(&self) {
+        let allocated = self.allocated_slots.load(Ordering::Acquire);
         for slot in 0..EPX_MAX_PIPES {
             if allocated & (1 << slot) != 0 {
-                self.epx_wakers[slot].wake();
+                self.wakers[slot].wake();
             }
         }
     }
 
     /// Slot whose turn it is to take a free EPX. `None` when nobody is queued.
-    fn epx_turn(&self) -> Option<usize> {
+    fn turn(&self) -> Option<usize> {
         self.with_arbiter(|a| a.turn())
     }
 
     /// Record that the pipe holding EPX had its transaction stopped.
-    fn mark_epx_yielded(&self, index: usize) {
-        if let Some(slot) = Self::epx_slot(index) {
+    fn mark_yielded(&self, index: usize) {
+        if let Some(slot) = Self::slot(index) {
             self.with_arbiter(|a| a.mark_yielded(slot));
         }
     }
 
     /// Record a completion the hardware could not signal because EPX was stopped.
-    fn mark_epx_completed(&self, index: usize) {
-        if let Some(slot) = Self::epx_slot(index) {
+    fn mark_completed(&self, index: usize) {
+        if let Some(slot) = Self::slot(index) {
             self.with_arbiter(|a| a.mark_completed(slot));
         }
     }
 
     /// Clear a pipe's completion bit, returning whether it was set.
-    fn take_epx_completed(&self, slot: usize) -> bool {
+    fn take_completed(&self, slot: usize) -> bool {
         self.with_arbiter(|a| a.take_completed(slot))
     }
 
     /// Record a terminal error against the pipe currently holding EPX.
-    fn mark_epx_error(&self, index: usize, error: EpxError) {
-        if let Some(slot) = Self::epx_slot(index) {
+    fn mark_error(&self, index: usize, error: EpxError) {
+        if let Some(slot) = Self::slot(index) {
             self.with_arbiter(|a| a.mark_error(slot, error));
         }
     }
 
     /// Take any terminal error recorded for a pipe.
-    fn take_epx_error(&self, slot: usize) -> Option<PipeError> {
+    fn take_error(&self, slot: usize) -> Option<PipeError> {
         self.with_arbiter(|a| a.take_error(slot))
     }
 
     /// Clear a pipe's yield bit, returning whether it was set.
-    fn take_epx_yielded(&self, slot: usize) -> bool {
+    fn take_yielded(&self, slot: usize) -> bool {
         self.with_arbiter(|a| a.take_yielded(slot))
     }
 
     /// Void any outcome the interrupt recorded for a pipe's finished attempt.
-    fn discard_epx_outcome(&self, slot: usize) {
+    fn discard_outcome(&self, slot: usize) {
         self.with_arbiter(|a| a.discard_outcome(slot));
     }
 }
@@ -1337,6 +1387,7 @@ struct EpxTransactionGuard<T: SealedHostInstance> {
 
 impl<T: SealedHostInstance> EpxTransactionGuard<T> {
     fn new<'d, E: pipe::Type, D: pipe::Direction>(channel: &Channel<'d, T, E, D>) -> Self {
+        debug_assert!(!(E::ep_type() == EndpointType::Interrupt && D::is_in()));
         Self {
             state: T::host_state(),
             index: channel.index,
@@ -1374,14 +1425,14 @@ impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
                 });
                 regs.buff_status().write_clear(|w| w.0 = 0b11);
             }
-            if let Some(slot) = EpxState::epx_slot(self.index) {
+            if let Some(slot) = EpxState::slot(self.index) {
                 self.state.epx.with_arbiter(|a| a.last = slot);
-                self.state.epx.discard_epx_outcome(slot);
+                self.state.epx.discard_outcome(slot);
             }
             self.state.epx.with_arbiter(|a| a.armed = false);
             self.state.epx.current_channel.store(0, Ordering::Release);
             disarm_epx_yield::<T>();
-            self.state.epx.wake_all_epx();
+            self.state.epx.wake_all();
 
             self.ep_control.modify(|w| {
                 w.set_interrupt_per_buff(false);
@@ -1393,18 +1444,19 @@ impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
 }
 
 impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T, E, D> {
-    fn epx_waker(&self) -> &AtomicWaker {
-        &T::host_state().epx.epx_wakers[self.epx_slot()]
+    fn waker(&self) -> &AtomicWaker {
+        &T::host_state().epx.wakers[self.epx_slot()]
     }
 
+    /// Wait until EPX is selected for this pipe and its buffer is idle.
     async fn wait_epx_buffer(&self) {
         trace!("CHANNEL {} WAIT AVAILABLE", self.index);
         poll_fn(|cx| {
-            self.epx_waker().register(cx.waker());
+            self.waker().register(cx.waker());
 
             let reg = self.buffer_control().read();
-            if self.can_run_epx_transaction() {
-                self.clear_sie_status();
+            if self.can_run_transaction() {
+                T::regs().buff_status().write_clear(|w| w.0 = 0b11);
             }
 
             if reg.available(0) {
@@ -1416,6 +1468,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         .await
     }
 
+    /// Configure the shared endpoint for the selected pipe.
     fn configure_epx_for_pipe(&self) {
         trace!(
             "SET CURRENT: {:?} CHANNEL {}: dev: {}, ep: {}, max_packet: {}, preamble: {}",
@@ -1461,56 +1514,13 @@ impl<'d, T: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, T> {
         let state = T::host_state();
         let pre = split_to_pre(split);
         if E::ep_type() == EndpointType::Interrupt {
-            let free_index = critical_section::with(|_| {
-                let alloc = state.interrupt_pipes.allocated_pipes.load(Ordering::Relaxed);
-                if let Some(idx) = (1..EP_COUNT).find(|i| alloc & (1 << i) == 0) {
-                    state
-                        .interrupt_pipes
-                        .allocated_pipes
-                        .store(alloc | (1 << idx), Ordering::Relaxed);
-                    Ok(idx as u8)
-                } else {
-                    Err(HostError::OutOfPipes)
-                }
-            })?;
+            let index = state.interrupt_pipes.allocate()?;
             // Fixed layout: pipe index 1..EP_COUNT maps to block 0..EP_COUNT-1.
-            let addr = DPRAM_DATA_OFFSET + (free_index as u16 - 1) * EPX_BLOCK_SIZE as u16;
+            let addr = DPRAM_DATA_OFFSET + (index as u16 - 1) * EPX_BLOCK_SIZE as u16;
 
-            Ok(Channel::new(free_index as _, addr, 64, endpoint, dev_addr, pre))
+            Ok(Channel::new(index, addr, 64, endpoint, dev_addr, pre))
         } else {
-            let index = critical_section::with(|_| {
-                let alloc = state.epx.allocated_epx.load(Ordering::Relaxed);
-                let slot = alloc.trailing_ones() as usize;
-                if slot >= EPX_MAX_PIPES {
-                    return Err(HostError::OutOfPipes);
-                }
-                state.epx.allocated_epx.store(alloc | (1 << slot), Ordering::Relaxed);
-                Ok(EP_COUNT + slot)
-            })?;
-            let slot = index - EP_COUNT;
-            // One buffer per pipe: a parked transfer's data must survive another pipe
-            // taking EPX in the meantime.
-            let len = (blocks_for(endpoint.max_packet_size) * EPX_BLOCK_SIZE) as u16;
-            let addr = match alloc_epx_mem(state, len) {
-                Ok(addr) => addr,
-                Err(()) => {
-                    // Hand back the slot claimed above, or repeated buffer failures
-                    // would exhaust the bitset and report `OutOfPipes` instead.
-                    critical_section::with(|_| {
-                        let epx = &state.epx.allocated_epx;
-                        epx.store(epx.load(Ordering::Relaxed) & !(1 << slot), Ordering::Relaxed);
-                    });
-
-                    return Err(HostError::InsufficientMemory);
-                }
-            };
-            debug!(
-                "EPX pipe ALLOC slot {} (bitset {:04x}) buf {:#x}+{}",
-                slot,
-                state.epx.allocated_epx.load(Ordering::Relaxed),
-                addr,
-                len
-            );
+            let (index, addr, len) = state.epx.allocate(endpoint.max_packet_size)?;
 
             Ok(Channel::new(index, addr, len, endpoint, dev_addr, pre))
         }
@@ -1681,20 +1691,20 @@ impl<T: SealedHostInstance> interrupt::typelevel::Handler<T::Interrupt> for Inte
                 "resume"
             } else if ints.stall() {
                 regs.inte().write_clear(|w| w.set_stall(true));
-                T::host_state().epx.wake_current_epx();
+                T::host_state().epx.wake_current();
                 "stall"
             } else if ints.error_rx_overflow() {
                 regs.inte().write_clear(|w| w.set_error_rx_overflow(true));
-                T::host_state().epx.wake_current_epx();
+                T::host_state().epx.wake_current();
                 "rx overflow"
             } else if ints.trans_complete() {
                 regs.inte().write_clear(|w| w.set_trans_complete(true));
                 note_epx_progress::<T>();
-                T::host_state().epx.wake_current_epx();
+                T::host_state().epx.wake_current();
                 "transaction complete"
             } else if ints.error_rx_timeout() {
                 regs.inte().write_clear(|w| w.set_error_rx_timeout(true));
-                T::host_state().epx.wake_current_epx();
+                T::host_state().epx.wake_current();
                 "rx timeout"
             } else if ints.buff_status() {
                 let status = regs.buff_status().read().0;
@@ -1704,7 +1714,7 @@ impl<T: SealedHostInstance> interrupt::typelevel::Handler<T::Interrupt> for Inte
                 if status & 0b11 != 0 {
                     regs.buff_status().write_clear(|w| w.0 = status & 0b11);
                     trace!("USB IRQ: EPx");
-                    T::host_state().epx.wake_current_epx();
+                    T::host_state().epx.wake_current();
                 }
 
                 for n in 1..EP_COUNT {
