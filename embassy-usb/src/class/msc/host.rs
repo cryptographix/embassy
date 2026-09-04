@@ -47,13 +47,9 @@ use super::bot::{
 use super::scsi::*;
 use super::{BOT_REQ_GET_MAX_LUN, BOT_REQ_RESET, USB_CLASS_MSC, USB_PROTOCOL_BULK_ONLY, USB_SUBCLASS_SCSI_TRANSPARENT};
 pub use super::{SenseData, SenseKey};
-use crate::host::control::{ControlType, Recipient, RequestType, SetupPacket};
+use crate::host::control::{SetupPacket, clear_endpoint_halt};
 use crate::host::descriptor::ConfigurationDescriptorChain;
 use crate::host::handler::EnumerationInfo;
-
-// Standard endpoint requests for stall recovery (USB 2.0 §9.4).
-const REQ_CLEAR_FEATURE: u8 = 0x01;
-const FEATURE_ENDPOINT_HALT: u16 = 0x0000;
 
 /// MSC host driver error.
 #[derive(Debug)]
@@ -315,14 +311,12 @@ where
     A: UsbHostAllocator<'d>,
 {
     async fn clear_halt_in(&mut self) -> Result<(), MscError> {
-        clear_endpoint_halt(&mut self.ctrl, self.bulk_in_ep).await?;
-        self.bulk_in.reset_data_toggle();
+        clear_endpoint_halt(&mut self.ctrl, &mut self.bulk_in, self.bulk_in_ep.into()).await?;
         Ok(())
     }
 
     async fn clear_halt_out(&mut self) -> Result<(), MscError> {
-        clear_endpoint_halt(&mut self.ctrl, self.bulk_out_ep).await?;
-        self.bulk_out.reset_data_toggle();
+        clear_endpoint_halt(&mut self.ctrl, &mut self.bulk_out, self.bulk_out_ep.into()).await?;
         Ok(())
     }
 
@@ -333,25 +327,6 @@ where
         self.clear_halt_out().await?;
         Ok(())
     }
-}
-
-async fn clear_endpoint_halt<P>(ctrl: &mut P, ep_addr: u8) -> Result<(), MscError>
-where
-    P: UsbPipe<pipe::Control, pipe::InOut>,
-{
-    let setup = SetupPacket {
-        request_type: RequestType {
-            direction: UsbDirection::Out,
-            control_type: ControlType::Standard,
-            recipient: Recipient::Endpoint,
-        },
-        request: REQ_CLEAR_FEATURE,
-        value: FEATURE_ENDPOINT_HALT,
-        index: ep_addr as u16,
-        length: 0,
-    };
-    ctrl.control_out(&setup.to_bytes(), &[]).await?;
-    Ok(())
 }
 
 async fn get_max_lun<P>(ctrl: &mut P, interface: u8) -> Result<u8, MscError>
