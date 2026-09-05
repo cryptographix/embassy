@@ -102,7 +102,7 @@ fn default_timeout() -> TimeoutConfig {
 struct EpxArbiter {
     /// Bitset of EPX pipes whose transaction was stopped at a NAK boundary.
     yielded: u16,
-    /// Bitset of EPX pipes queued in `wait_ready_for_transaction`.
+    /// Bitset of EPX pipes queued in `acquire_epx`.
     waiting: u16,
     /// Whether EPX has a transaction armed. Framing errors come from the shared RX
     /// engine, so they are only charged to EPX while it is mid-transaction.
@@ -780,7 +780,7 @@ impl<T: SealedHostInstance> Drop for InterruptTransferGuard<T> {
     }
 }
 
-struct TransactionGuard<T: SealedHostInstance> {
+struct EpxTransactionGuard<T: SealedHostInstance> {
     state: &'static HostState,
     index: usize,
     ep_control: EpControlReg,
@@ -789,7 +789,7 @@ struct TransactionGuard<T: SealedHostInstance> {
     _phantom: PhantomData<T>,
 }
 
-impl<T: SealedHostInstance> TransactionGuard<T> {
+impl<T: SealedHostInstance> EpxTransactionGuard<T> {
     fn arm(&mut self) {
         self.transaction_active = true;
         self.state.with_arbiter(|a| a.armed = true);
@@ -801,7 +801,7 @@ impl<T: SealedHostInstance> TransactionGuard<T> {
     }
 }
 
-impl<T: SealedHostInstance> Drop for TransactionGuard<T> {
+impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
     fn drop(&mut self) {
         let selected = self.state.current_channel.load(Ordering::Relaxed);
         if selected == self.index || selected == 0 {
@@ -965,7 +965,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             self.waker().register(cx.waker());
 
             let reg = self.buffer_control().read();
-            if self.is_ready_for_transaction() {
+            if self.can_run_epx_transaction() {
                 T::regs().buff_status().write_clear(|w| w.0 = 0b11);
             }
 
@@ -977,61 +977,61 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         .await
     }
 
-    /// Is hardware configured to perform transaction with this buffer
-    /// Always true for INTERRUPT channel
-    fn is_ready_for_transaction(&self) -> bool {
-        if Self::is_interrupt() {
-            true
-        } else {
-            let state = T::host_state();
-            let sel = state.current_channel.load(Ordering::Relaxed);
-            if sel == self.index {
-                return true;
-            }
-            if sel != 0 {
-                return false;
-            }
+    /// Do we hold the shared endpoint, or may we take it next?
+    fn can_run_epx_transaction(&self) -> bool {
+        let state = T::host_state();
+        let sel = state.current_channel.load(Ordering::Relaxed);
+        if sel == self.index {
+            return true;
+        }
+        if sel != 0 {
+            return false;
+        }
 
-            // EPX is free: take it only when the queue says it is our turn, so a
-            // pipe that keeps re-arming cannot monopolise the endpoint.
-            match state.epx_turn() {
-                Some(slot) => slot == self.epx_slot(),
-                None => true,
-            }
+        // EPX is free: take it only when the queue says it is our turn, so a
+        // pipe that keeps re-arming cannot monopolise the endpoint.
+        match state.epx_turn() {
+            Some(slot) => slot == self.epx_slot(),
+            None => true,
         }
     }
 
-    async fn wait_ready_for_transaction(&self) {
-        debug_assert!(!Self::is_interrupt());
+    /// Take EPX for this pipe. The guard releases it.
+    ///
+    /// The ticket must span both waits: leaving the queue early would let another pipe be
+    /// granted the turn while this one is still settling its buffer.
+    async fn acquire_epx(&self) -> EpxTransactionGuard<T> {
         trace!("CHANNEL {} WAIT READY", self.index);
 
-        // Join the queue for EPX. Dropped with this future, cancelled or not.
-        let _ticket = WaitTicket::<T>::new(self.epx_slot());
-        // Wait for other transaction end
-        poll_fn(|cx| {
-            self.waker().register(cx.waker());
+        {
+            let _ticket = WaitTicket::<T>::new(self.epx_slot());
+            poll_fn(|cx| {
+                self.waker().register(cx.waker());
 
-            if self.is_ready_for_transaction() {
-                #[cfg(feature = "_rp235x")]
-                disarm_epx_yield::<T>();
+                if self.can_run_epx_transaction() {
+                    #[cfg(feature = "_rp235x")]
+                    disarm_epx_yield::<T>();
 
-                return Poll::Ready(());
-            }
+                    return Poll::Ready(());
+                }
 
-            trace!("CHANNEL {} EPX contention: request yield", self.index);
-            arm_epx_yield::<T>();
+                trace!("CHANNEL {} EPX contention: request yield", self.index);
+                arm_epx_yield::<T>();
 
-            Poll::Pending
-        })
-        .await;
+                Poll::Pending
+            })
+            .await;
 
-        // Once this pipe owns EPX, wait for its transfer buffer to be free.
-        self.wait_epx_buffer().await;
+            self.wait_epx_buffer().await;
+        }
+
+        self.set_current();
+        self.epx_transaction_guard()
     }
 
     // FIXME: RX Timeout with LS device on hub
     /// Start transaction and wait it to be complete
-    async fn wait_transaction(&self) -> Result<TransactionStatus, PipeError> {
+    async fn wait_epx_transaction(&self) -> Result<TransactionStatus, PipeError> {
         assert!(!Self::is_interrupt());
         let regs = T::regs();
 
@@ -1150,9 +1150,10 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         }
     }
 
-    fn transaction_guard(&self) -> TransactionGuard<T> {
+    /// EPX only.
+    fn epx_transaction_guard(&self) -> EpxTransactionGuard<T> {
         debug_assert!(!Self::is_interrupt());
-        TransactionGuard {
+        EpxTransactionGuard {
             state: T::host_state(),
             index: self.index,
             ep_control: self.ep_control(),
@@ -1388,25 +1389,23 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Claim EPX and run one transaction on it. `arm` programs the buffer once this
     /// pipe owns the endpoint.
-    async fn run_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
+    async fn run_epx_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
         let deadline = self
             .control_timeout_us
             .map(|us| embassy_time::Instant::now() + embassy_time::Duration::from_micros(us));
 
         loop {
-            self.wait_ready_for_transaction().await;
-            self.set_current();
-            let mut guard = self.transaction_guard();
+            let mut guard = self.acquire_epx().await;
 
             arm(self);
             guard.arm();
             let result = if let Some(deadline) = deadline {
-                match embassy_time::with_deadline(deadline, self.wait_transaction()).await {
+                match embassy_time::with_deadline(deadline, self.wait_epx_transaction()).await {
                     Ok(result) => result,
                     Err(_) => Ok(self.stop_timed_out_transaction()),
                 }
             } else {
-                self.wait_transaction().await
+                self.wait_epx_transaction().await
             };
 
             // Only a completed transaction is known to have released the SIE, so any other
@@ -1435,7 +1434,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Receive one packet, returning its length.
     async fn transfer_in_packet(&mut self, len: u16, pid: bool) -> Result<usize, PipeError> {
-        self.run_transaction(|s| s.set_data_in(len, pid)).await?;
+        self.run_epx_transaction(|s| s.set_data_in(len, pid)).await?;
 
         Ok(self.buffer_control().read().length(0) as usize)
     }
@@ -1443,7 +1442,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// Send one packet, returning how much of `data` it carried.
     async fn transfer_out_packet(&mut self, data: &[u8], pid: bool) -> Result<usize, PipeError> {
         let mut len = 0;
-        self.run_transaction(|s| len = s.set_data_out(data, pid)).await?;
+        self.run_epx_transaction(|s| len = s.set_data_out(data, pid)).await?;
 
         Ok(len)
     }
@@ -1508,7 +1507,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// WARNING: This flips PID
     async fn send_setup(&mut self, setup: &[u8; 8]) -> Result<(), PipeError> {
         trace!("SEND SETUP");
-        self.run_transaction(|s| s.set_setup_packet(setup)).await?;
+        self.run_epx_transaction(|s| s.set_setup_packet(setup)).await?;
         self.pid = true;
 
         Ok(())
@@ -1518,7 +1517,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     async fn control_status(&mut self, active_direction_out: bool) -> Result<(), PipeError> {
         // Status packet always have DATA1
         trace!("SEND STATUS");
-        self.run_transaction(|s| {
+        self.run_epx_transaction(|s| {
             if active_direction_out {
                 s.set_data_in(0, true);
             } else {
