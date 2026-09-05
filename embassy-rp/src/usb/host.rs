@@ -749,13 +749,8 @@ impl<T: SealedHostInstance> Drop for TransactionGuard<T> {
 }
 
 impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T, E, D> {
-    /// Get channel waker
     fn waker(&self) -> &AtomicWaker {
-        if Self::is_interrupt() {
-            &EP_IN_WAKERS[self.index]
-        } else {
-            &T::host_state().epx.epx_wakers[self.epx_slot()]
-        }
+        &T::host_state().epx.epx_wakers[self.epx_slot()]
     }
 
     /// Whether this pipe was made to yield EPX since the last check.
@@ -840,7 +835,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     fn poll_interrupt_buffer(&self, cx: &mut core::task::Context<'_>) -> Poll<Result<(), PipeError>> {
         // Both directions use the IN endpoint registers in host mode.
-        self.waker().register(cx.waker());
+        EP_IN_WAKERS[self.index].register(cx.waker());
 
         if T::host_state().interrupt_pipes.take_timeout(self.index) {
             T::regs().int_ep_ctrl().modify(|w| {
@@ -873,7 +868,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             self.waker().register(cx.waker());
 
             let reg = self.buffer_control().read();
-            if self.is_ready_for_transaction() {
+            if self.can_run_transaction() {
                 T::regs().buff_status().write_clear(|w| w.0 = 0b11);
             }
 
@@ -885,27 +880,21 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         .await
     }
 
-    /// Is hardware configured to perform transaction with this buffer
-    /// Always true for INTERRUPT channel
-    fn is_ready_for_transaction(&self) -> bool {
-        if Self::is_interrupt() {
-            true
-        } else {
-            let state = T::host_state();
-            let sel = state.epx.current_channel.load(Ordering::Relaxed);
-            if sel == self.index {
-                return true;
-            }
-            if sel != 0 {
-                return false;
-            }
+    /// Do we hold the shared endpoint, or may we take it next?
+    fn can_run_transaction(&self) -> bool {
+        let state = T::host_state();
+        let sel = state.epx.current_channel.load(Ordering::Relaxed);
+        if sel == self.index {
+            return true;
+        }
+        if sel != 0 {
+            return false;
+        }
 
-            // EPX is free: take it only when the queue says it is our turn, so a
-            // pipe that keeps re-arming cannot monopolise the endpoint.
-            match state.epx.epx_turn() {
-                Some(slot) => slot == self.epx_slot(),
-                None => true,
-            }
+        // A pipe that keeps re-arming must not monopolise EPX.
+        match state.epx.epx_turn() {
+            Some(slot) => slot == self.epx_slot(),
+            None => true,
         }
     }
 
@@ -919,7 +908,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         poll_fn(|cx| {
             self.waker().register(cx.waker());
 
-            if self.is_ready_for_transaction() {
+            if self.can_run_transaction() {
                 #[cfg(feature = "_rp235x")]
                 disarm_epx_yield::<T>();
 
@@ -939,7 +928,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     // FIXME: RX Timeout with LS device on hub
     /// Start transaction and wait it to be complete
-    async fn wait_transaction(&self) -> Result<TransactionStatus, PipeError> {
+    async fn wait_epx_transaction(&self) -> Result<TransactionStatus, PipeError> {
         assert!(!Self::is_interrupt());
         let regs = T::regs();
 
@@ -994,10 +983,9 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         res
     }
 
-    /// Mark this channel as currently used and configure endpoint type
-    ///
-    /// Call once on creation for interrupt pipe
-    fn set_current(&self) {
+    /// Restore the dedicated endpoint configuration before each transfer.
+    fn configure_interrupt(&self) {
+        debug_assert!(Self::is_interrupt());
         let regs = T::regs();
         trace!(
             "SET CURRENT: {:?} CHANNEL {}: dev: {}, ep: {}, max_packet: {}, preamble: {}",
@@ -1008,54 +996,60 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             self.max_packet_size,
             self.pre
         );
-        if Self::is_interrupt() {
-            self.ep_control().write(|w| {
-                w.set_endpoint_type(EpControlEndpointType::Interrupt);
-                w.set_interrupt_per_buff(true);
+        self.ep_control().write(|w| {
+            w.set_endpoint_type(EpControlEndpointType::Interrupt);
+            w.set_interrupt_per_buff(true);
 
-                // `host_poll_interval` (bits 16:25) has no PAC accessor and counts from
-                // zero, so clamp: a descriptor may declare an interval of 0.
-                let interval = self.interval.max(1) as u32 - 1;
-                w.0 |= interval << 16;
+            // The field has no PAC accessor and counts from zero; clamp a declared interval of 0.
+            let interval = self.interval.max(1) as u32 - 1;
+            w.0 |= interval << 16;
 
-                w.set_buffer_address(self.buf.addr);
-                w.set_enable(true);
+            w.set_buffer_address(self.buf.addr);
+            w.set_enable(true);
+        });
+
+        // FIXME: What is this for?
+        regs.sie_ctrl().modify(|w| w.set_sof_sync(true));
+
+        self.addr_endp_host().write(|w| {
+            w.set_address(self.dev_addr);
+            w.set_endpoint(self.ep_addr);
+            w.set_intep_dir(D::is_out());
+            w.set_intep_preamble(self.pre)
+        });
+    }
+
+    /// Configure the shared endpoint for this pipe.
+    fn configure_epx_for_pipe(&self) {
+        trace!(
+            "SET CURRENT: {:?} CHANNEL {}: dev: {}, ep: {}, max_packet: {}, preamble: {}",
+            E::ep_type(),
+            self.index,
+            self.dev_addr,
+            self.ep_addr,
+            self.max_packet_size,
+            self.pre
+        );
+        T::host_state().epx.current_channel.store(self.index, Ordering::Relaxed);
+
+        T::regs().addr_endp().write(|w| {
+            w.set_address(self.dev_addr);
+            w.set_endpoint(self.ep_addr);
+        });
+
+        self.ep_control().modify(|w| {
+            w.set_enable(true);
+            w.set_interrupt_per_buff(true);
+            w.set_buffer_address(self.buf.addr);
+            w.set_endpoint_type(match E::ep_type() {
+                EndpointType::Control => EpControlEndpointType::Control,
+                EndpointType::Isochronous => EpControlEndpointType::Isochronous,
+                EndpointType::Bulk => EpControlEndpointType::Bulk,
+                EndpointType::Interrupt => EpControlEndpointType::Interrupt,
             });
+        });
 
-            // FIXME: What is this for?
-            regs.sie_ctrl().modify(|w| w.set_sof_sync(true));
-
-            self.addr_endp_host().write(|w| {
-                w.set_address(self.dev_addr);
-                w.set_endpoint(self.ep_addr);
-                w.set_intep_dir(D::is_out());
-                w.set_intep_preamble(self.pre)
-            });
-        } else {
-            T::host_state().epx.current_channel.store(self.index, Ordering::Relaxed);
-
-            T::regs().addr_endp().write(|w| {
-                w.set_address(self.dev_addr);
-                w.set_endpoint(self.ep_addr);
-            });
-
-            self.ep_control().modify(|w| {
-                w.set_enable(true);
-                w.set_interrupt_per_buff(true);
-                w.set_buffer_address(self.buf.addr);
-
-                let epty = match E::ep_type() {
-                    EndpointType::Control => EpControlEndpointType::Control,
-                    EndpointType::Isochronous => EpControlEndpointType::Isochronous,
-                    EndpointType::Bulk => EpControlEndpointType::Bulk,
-                    EndpointType::Interrupt => EpControlEndpointType::Interrupt,
-                };
-
-                w.set_endpoint_type(epty);
-            });
-
-            regs.sie_ctrl().modify(|w| w.set_preamble_en(self.pre));
-        }
+        T::regs().sie_ctrl().modify(|w| w.set_preamble_en(self.pre));
     }
 
     fn transaction_guard(&self) -> TransactionGuard<T> {
@@ -1158,7 +1152,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// Read one packet from a dedicated interrupt endpoint.
     async fn interrupt_in_read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
         self.wait_interrupt_buffer().await?;
-        self.set_current();
+        self.configure_interrupt();
         self.settle_interrupt_toggle();
         let mut guard = self.interrupt_transfer_guard();
         guard.arm();
@@ -1196,7 +1190,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// Write to a dedicated interrupt endpoint, one packet per poll.
     async fn interrupt_out_write(&mut self, buf: &[u8], ensure_transaction_end: bool) -> Result<(), PipeError> {
         self.wait_interrupt_buffer().await?;
-        self.set_current();
+        self.configure_interrupt();
         self.settle_interrupt_toggle();
         let mut guard = self.interrupt_transfer_guard();
         guard.arm();
@@ -1296,25 +1290,25 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Claim EPX and run one transaction on it. `arm` programs the buffer once this
     /// pipe owns the endpoint.
-    async fn run_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
+    async fn run_epx_transaction(&mut self, mut arm: impl FnMut(&mut Self)) -> Result<(), PipeError> {
         let deadline = self
             .control_timeout_us
             .map(|us| embassy_time::Instant::now() + embassy_time::Duration::from_micros(us));
 
         loop {
             self.wait_ready_for_transaction().await;
-            self.set_current();
+            self.configure_epx_for_pipe();
             let mut guard = self.transaction_guard();
 
             arm(self);
             guard.arm();
             let result = if let Some(deadline) = deadline {
-                match embassy_time::with_deadline(deadline, self.wait_transaction()).await {
+                match embassy_time::with_deadline(deadline, self.wait_epx_transaction()).await {
                     Ok(result) => result,
                     Err(_) => Ok(self.stop_timed_out_transaction()),
                 }
             } else {
-                self.wait_transaction().await
+                self.wait_epx_transaction().await
             };
 
             // Only a completed transaction is known to have released the SIE, so any other
@@ -1343,7 +1337,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
     /// Receive one packet, returning its length.
     async fn transfer_in_packet(&mut self, len: u16, pid: bool) -> Result<usize, PipeError> {
-        self.run_transaction(|s| s.set_data_in(len, pid)).await?;
+        self.run_epx_transaction(|s| s.set_data_in(len, pid)).await?;
 
         Ok(self.buffer_control().read().length(0) as usize)
     }
@@ -1351,7 +1345,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// Send one packet, returning how much of `data` it carried.
     async fn transfer_out_packet(&mut self, data: &[u8], pid: bool) -> Result<usize, PipeError> {
         let mut len = 0;
-        self.run_transaction(|s| len = s.set_data_out(data, pid)).await?;
+        self.run_epx_transaction(|s| len = s.set_data_out(data, pid)).await?;
 
         Ok(len)
     }
@@ -1416,7 +1410,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     /// WARNING: This flips PID
     async fn send_setup(&mut self, setup: &[u8; 8]) -> Result<(), PipeError> {
         trace!("SEND SETUP");
-        self.run_transaction(|s| s.set_setup_packet(setup)).await?;
+        self.run_epx_transaction(|s| s.set_setup_packet(setup)).await?;
         self.pid = true;
 
         Ok(())
@@ -1426,7 +1420,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
     async fn control_status(&mut self, active_direction_out: bool) -> Result<(), PipeError> {
         // Status packet always have DATA1
         trace!("SEND STATUS");
-        self.run_transaction(|s| {
+        self.run_epx_transaction(|s| {
             if active_direction_out {
                 s.set_data_in(0, true);
             } else {
