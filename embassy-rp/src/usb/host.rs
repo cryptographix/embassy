@@ -102,7 +102,7 @@ fn default_timeout() -> TimeoutConfig {
 struct EpxArbiter {
     /// Bitset of EPX pipes whose transaction was stopped at a NAK boundary.
     yielded: u16,
-    /// Bitset of EPX pipes queued in `wait_ready_for_transaction`.
+    /// Bitset of EPX pipes queued in `acquire_epx`.
     waiting: u16,
     /// Whether EPX has a transaction armed. Framing errors come from the shared RX
     /// engine, so they are only charged to EPX while it is mid-transaction.
@@ -688,7 +688,7 @@ impl<T: SealedHostInstance> Drop for InterruptTransferGuard<T> {
     }
 }
 
-struct TransactionGuard<T: SealedHostInstance> {
+struct EpxTransactionGuard<T: SealedHostInstance> {
     state: &'static HostState,
     index: usize,
     ep_control: EpControlReg,
@@ -697,7 +697,19 @@ struct TransactionGuard<T: SealedHostInstance> {
     _phantom: PhantomData<T>,
 }
 
-impl<T: SealedHostInstance> TransactionGuard<T> {
+impl<T: SealedHostInstance> EpxTransactionGuard<T> {
+    fn new<'d, E: pipe::Type, D: pipe::Direction>(channel: &Channel<'d, T, E, D>) -> Self {
+        debug_assert!(E::ep_type() != EndpointType::Interrupt);
+        Self {
+            state: T::host_state(),
+            index: channel.index,
+            ep_control: channel.ep_control(),
+            buffer_control: channel.buffer_control(),
+            transaction_active: false,
+            _phantom: PhantomData,
+        }
+    }
+
     fn arm(&mut self) {
         self.transaction_active = true;
         self.state.epx.with_arbiter(|a| a.armed = true);
@@ -709,7 +721,7 @@ impl<T: SealedHostInstance> TransactionGuard<T> {
     }
 }
 
-impl<T: SealedHostInstance> Drop for TransactionGuard<T> {
+impl<T: SealedHostInstance> Drop for EpxTransactionGuard<T> {
     fn drop(&mut self) {
         let selected = self.state.epx.current_channel.load(Ordering::Relaxed);
         if selected == self.index || selected == 0 {
@@ -898,32 +910,36 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         }
     }
 
-    async fn wait_ready_for_transaction(&self) {
-        debug_assert!(!Self::is_interrupt());
+    /// Take EPX for this pipe. The guard releases it.
+    async fn acquire_epx(&self) -> EpxTransactionGuard<T> {
         trace!("CHANNEL {} WAIT READY", self.index);
 
-        // Join the queue for EPX. Dropped with this future, cancelled or not.
-        let _ticket = WaitTicket::<T>::new(self.epx_slot());
-        // Wait for other transaction end
-        poll_fn(|cx| {
-            self.waker().register(cx.waker());
+        // Keep the ticket through both waits so another pipe cannot be granted EPX
+        // while this one is still waiting for its buffer to settle.
+        {
+            let _ticket = WaitTicket::<T>::new(self.epx_slot());
+            poll_fn(|cx| {
+                self.waker().register(cx.waker());
 
-            if self.can_run_transaction() {
-                #[cfg(feature = "_rp235x")]
-                disarm_epx_yield::<T>();
+                if self.can_run_transaction() {
+                    #[cfg(feature = "_rp235x")]
+                    disarm_epx_yield::<T>();
 
-                return Poll::Ready(());
-            }
+                    return Poll::Ready(());
+                }
 
-            trace!("CHANNEL {} EPX contention: request yield", self.index);
-            arm_epx_yield::<T>();
+                trace!("CHANNEL {} EPX contention: request yield", self.index);
+                arm_epx_yield::<T>();
 
-            Poll::Pending
-        })
-        .await;
+                Poll::Pending
+            })
+            .await;
 
-        // Once this pipe owns EPX, wait for its transfer buffer to be free.
-        self.wait_epx_buffer().await;
+            self.wait_epx_buffer().await;
+        }
+
+        self.configure_epx_for_pipe();
+        EpxTransactionGuard::new(self)
     }
 
     // FIXME: RX Timeout with LS device on hub
@@ -1050,18 +1066,6 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         });
 
         T::regs().sie_ctrl().modify(|w| w.set_preamble_en(self.pre));
-    }
-
-    fn transaction_guard(&self) -> TransactionGuard<T> {
-        debug_assert!(!Self::is_interrupt());
-        TransactionGuard {
-            state: T::host_state(),
-            index: self.index,
-            ep_control: self.ep_control(),
-            buffer_control: self.buffer_control(),
-            transaction_active: false,
-            _phantom: PhantomData,
-        }
     }
 
     fn interrupt_transfer_guard(&self) -> InterruptTransferGuard<T> {
@@ -1296,9 +1300,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             .map(|us| embassy_time::Instant::now() + embassy_time::Duration::from_micros(us));
 
         loop {
-            self.wait_ready_for_transaction().await;
-            self.configure_epx_for_pipe();
-            let mut guard = self.transaction_guard();
+            let mut guard = self.acquire_epx().await;
 
             arm(self);
             guard.arm();
