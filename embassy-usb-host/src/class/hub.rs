@@ -10,10 +10,10 @@ use core::ops::Deref;
 use bitflags::bitflags;
 use embassy_time::Timer;
 use embassy_usb::control::Request;
-use embassy_usb_driver::host::{HostError, SplitInfo, SplitSpeed, UsbHostAllocator, UsbPipe, pipe};
-use embassy_usb_driver::{Direction, EndpointInfo, EndpointType, Speed};
+use embassy_usb_driver::host::{HostError, PipeError, SplitInfo, SplitSpeed, UsbHostAllocator, UsbPipe, pipe};
+use embassy_usb_driver::{Direction, EndpointAddress, EndpointInfo, EndpointType, Speed};
 
-use crate::control::{ControlPipeExt, ControlType, Recipient, RequestType, SetupPacket};
+use crate::control::{ControlPipeExt, ControlType, Recipient, RequestType, SetupPacket, clear_endpoint_halt};
 use crate::descriptor::{
     DEFAULT_MAX_DESCRIPTOR_SIZE, DescriptorError, InterfaceDescriptor, USBDescriptor, VariableSizeDescriptor,
     WritableDescriptor,
@@ -31,6 +31,7 @@ const PORT_ENABLE_POLL_MS: u64 = 10;
 pub struct HubHandler<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> {
     bus: BusHandle<'d, A>,
     interrupt_channel: A::Pipe<pipe::Interrupt, pipe::In>,
+    interrupt_endpoint: EndpointAddress,
     control_channel: A::Pipe<pipe::Control, pipe::InOut>,
     desc: HubDescriptor,
     device_address: u8,
@@ -118,6 +119,7 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
         let mut hub = HubHandler {
             bus: bus.clone(),
             interrupt_channel,
+            interrupt_endpoint: interrupt_ep.endpoint_address.into(),
             control_channel,
             desc,
             device_address: enum_info.device_address,
@@ -139,7 +141,7 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
             // 1 hub + maximum of 255 ports (USB 2.0 Spec 11.12.3 and 11.23.2.1)
             let mut buf = [0u8; (1 + 255) / u8::BITS as usize];
             let slice = &mut buf[..(self.desc.port_num as usize / 8) + 1];
-            self.interrupt_channel.request_in(slice).await?;
+            self.read_interrupt(slice).await?;
 
             let mut hub_changes = HubInterrupt(slice);
             if hub_changes.take_hub_change() {
@@ -224,6 +226,23 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
                     return Err(HostError::Other("Unhandled port status change"));
                 }
             }
+        }
+    }
+
+    async fn read_interrupt(&mut self, buf: &mut [u8]) -> Result<(), HostError> {
+        match self.interrupt_channel.request_in(buf).await {
+            Ok(_) => Ok(()),
+            Err(PipeError::Stall) => {
+                clear_endpoint_halt(
+                    &mut self.control_channel,
+                    &mut self.interrupt_channel,
+                    self.interrupt_endpoint,
+                )
+                .await?;
+                self.interrupt_channel.request_in(buf).await?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
