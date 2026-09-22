@@ -12,7 +12,7 @@ use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, Instance, InterruptHandler};
-use embassy_usb::class::midi::{MidiClass, MidiClassConfig};
+use embassy_usb::class::midi::{MidiClass, MidiClassConfig, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
 use panic_probe as _;
@@ -40,6 +40,7 @@ async fn main(_spawner: Spawner) {
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     // It needs some buffers for building the descriptors.
+    let mut midi_state = State::new();
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
@@ -54,7 +55,13 @@ async fn main(_spawner: Spawner) {
     );
 
     // Create classes on the builder.
-    let mut class = MidiClass::new(&mut builder, MidiClassConfig::default());
+    // The names are shown by the host for its MIDI ports.
+    let mut midi_config = MidiClassConfig::default();
+    midi_config.interface_name = Some("Embassy MIDI");
+    midi_config.in_jack_names = &["Embassy MIDI In"];
+    midi_config.out_jack_names = &["Embassy MIDI Out"];
+
+    let mut class = MidiClass::new_with_names(&mut builder, &mut midi_state, midi_config);
 
     // The `MidiClass` can be split into `Sender` and `Receiver`, to be used in separate tasks.
     // let (sender, receiver) = class.split();
