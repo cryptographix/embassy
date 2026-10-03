@@ -4,7 +4,7 @@ use embassy_usb_driver::{EndpointAddress, EndpointIn, EndpointOut};
 use heapless::Vec;
 
 use super::class_codes::*;
-use super::terminal_type::TerminalType;
+use crate::class::uac::terminal_type::TerminalType;
 use super::{ChannelConfig, SampleWidth};
 use crate::builder::InterfaceAltBuilder;
 use crate::control::{InResponse, OutResponse, Recipient, Request, RequestType};

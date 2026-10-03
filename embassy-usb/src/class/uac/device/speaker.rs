@@ -20,7 +20,7 @@ use embassy_sync::waitqueue::WakerRegistration;
 use heapless::Vec;
 
 use super::class_codes::*;
-use super::terminal_type::TerminalType;
+use crate::class::uac::terminal_type::TerminalType;
 use super::{Channel, ChannelConfig, FeedbackRefresh, MAX_AUDIO_CHANNEL_COUNT, MAX_AUDIO_CHANNEL_INDEX, SampleWidth};
 use crate::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
 use crate::descriptor::{SynchronizationType, UsageType};
