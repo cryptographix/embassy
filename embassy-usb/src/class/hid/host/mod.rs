@@ -10,7 +10,8 @@ use embassy_usb_driver::{Direction as UsbDirection, EndpointAddress, EndpointInf
 
 pub use self::hid_report::{ReportDescriptor, ReportField};
 use super::{
-    HID_DESC_TYPE_HID, HID_REQ_GET_REPORT, HID_REQ_SET_IDLE, HID_REQ_SET_PROTOCOL, HID_REQ_SET_REPORT, USB_CLASS_HID,
+    HID_DESC_TYPE_HID, HID_DESC_TYPE_REPORT, HID_REQ_GET_REPORT, HID_REQ_SET_IDLE, HID_REQ_SET_PROTOCOL,
+    HID_REQ_SET_REPORT, USB_CLASS_HID,
 };
 pub use super::{HidProtocolMode, ReportId};
 use crate::host::control::SetupPacket;
@@ -130,6 +131,15 @@ impl MouseReport {
     /// Returns `true` if the middle button is pressed.
     pub fn middle(&self) -> bool {
         self.buttons & Self::BUTTON_MIDDLE != 0
+    }
+}
+
+impl SetupPacket {
+    /// Build a GET_DESCRIPTOR(HID Report Descriptor) SETUP packet.
+    ///
+    /// `interface` is the HID interface number; `len` is from `HidInfo::report_descriptor_len`.
+    pub const fn get_hid_report_descriptor(interface: u8, len: u16) -> Self {
+        Self::get_interface_descriptor(HID_DESC_TYPE_REPORT, interface as u16, len)
     }
 }
 
