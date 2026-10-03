@@ -6,6 +6,7 @@ use embassy_usb_driver::Direction;
 pub use embassy_usb_driver::host::pipe;
 use embassy_usb_driver::host::{HostError, UsbPipe};
 
+use crate::class::hid::HID_DESC_TYPE_REPORT;
 use crate::control::Request;
 use crate::host::descriptor::{USBDescriptor, descriptor_type};
 
@@ -134,9 +135,6 @@ pub struct SetupPacket {
     pub length: u16,
 }
 
-/// HID class descriptor type: Report (HID 1.11 §7.1.1).
-const HID_REPORT_DESCRIPTOR_TYPE: u8 = 0x22;
-
 impl SetupPacket {
     /// Serialize this SETUP packet to its 8-byte wire format.
     ///
@@ -249,7 +247,7 @@ impl SetupPacket {
     ///
     /// `interface` is the HID interface number; `len` is from `HidInfo::report_descriptor_len`.
     pub const fn get_hid_report_descriptor(interface: u8, len: u16) -> Self {
-        Self::get_interface_descriptor(HID_REPORT_DESCRIPTOR_TYPE, interface as u16, len)
+        Self::get_interface_descriptor(HID_DESC_TYPE_REPORT, interface as u16, len)
     }
 
     /// Build a SET_ADDRESS SETUP packet.
