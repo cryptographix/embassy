@@ -6,8 +6,8 @@ use core::task::Poll;
 
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::host::{
-    DeviceEvent, HostError, PipeError, SplitInfo, SplitSpeed, TimeoutConfig, UsbHostAllocator, UsbHostController,
-    UsbPipe, pipe,
+    AddressSet, DeviceEvent, HostError, PipeError, SplitInfo, SplitSpeed, TimeoutConfig, UsbHostAllocator,
+    UsbHostController, UsbPipe, pipe,
 };
 use embassy_usb_driver::{EndpointInfo, EndpointType, Speed};
 
@@ -331,16 +331,18 @@ impl HostState {
         })
     }
 
-    /// Bump the generation of the device at `addr` (every device for `None`) and wake the pipes waiting on it.
-    fn device_removed(&self, addr: Option<u8>) {
+    /// Bump the generation of the devices in `addrs` and wake pipes.
+    /// Pipes on removed devices will fail with [`PipeError::Disconnected`].
+    fn device_removed(&self, addrs: AddressSet) {
         critical_section::with(|cs| {
-            for (i, generation) in self.generation.borrow(cs).borrow_mut().iter_mut().enumerate() {
-                if addr.is_none_or(|addr| addr as usize == i) {
-                    *generation = generation.wrapping_add(1);
-                }
+            let mut generation = self.generation.borrow(cs).borrow_mut();
+            for addr in addrs {
+                generation[addr as usize] = generation[addr as usize].wrapping_add(1);
             }
         });
-        EP_IN_WAKERS.iter().for_each(|waker| waker.wake());
+        // Wake pipes - generation check is only performed when pipe polled.
+        self.wake_all_interrupt();
+        self.wake_all_epx();
     }
 
     fn reset(&self) {
@@ -363,6 +365,16 @@ impl HostState {
     fn wake_current_epx(&self) {
         if let Some(slot) = Self::epx_slot(self.current_channel.load(Ordering::Acquire)) {
             self.epx_wakers[slot].wake();
+        }
+    }
+
+    /// Wake every allocated interrupt pipe.
+    fn wake_all_interrupt(&self) {
+        let allocated = self.interrupt_pipes.allocated.load(Ordering::Acquire);
+        for (index, waker) in EP_IN_WAKERS.iter().enumerate() {
+            if allocated & (1 << index) != 0 {
+                waker.wake();
+            }
         }
     }
 
@@ -900,6 +912,14 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         E::ep_type() == EndpointType::Interrupt
     }
 
+    /// Fails if the device was removed since this pipe was allocated.
+    fn check_present(&self) -> Result<(), PipeError> {
+        match T::host_state().generation(self.dev_addr) == self.generation {
+            true => Ok(()),
+            false => Err(PipeError::Disconnected),
+        }
+    }
+
     /// Wait for the buffer to be available, or fail if its device was removed.
     async fn wait_available(&self) -> Result<(), PipeError> {
         trace!("CHANNEL {} WAIT AVAILABLE", self.index);
@@ -908,9 +928,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
             self.waker().register(cx.waker());
 
             // Disconnected since allocation: this transfer can never complete.
-            if Self::is_interrupt() && T::host_state().generation(self.dev_addr) != self.generation {
-                return Poll::Ready(Err(PipeError::Disconnected));
-            }
+            self.check_present()?;
 
             let reg = self.buffer_control().read();
 
@@ -958,8 +976,10 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         // Join the queue for EPX. Dropped with this future, cancelled or not.
         let _ticket = (!Self::is_interrupt()).then(|| WaitTicket::<T>::new(self.epx_slot()));
         // Wait for other transaction end
-        poll_fn(|cx| {
+        poll_fn(|cx| -> Poll<Result<(), PipeError>> {
             self.waker().register(cx.waker());
+
+            self.check_present()?;
 
             if self.is_ready_for_transaction() {
                 #[cfg(feature = "_rp235x")]
@@ -967,7 +987,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
                     disarm_epx_yield::<T>();
                 }
 
-                return Poll::Ready(());
+                return Poll::Ready(Ok(()));
             }
 
             trace!("CHANNEL {} EPX contention: request yield", self.index);
@@ -975,7 +995,7 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
 
             Poll::Pending
         })
-        .await;
+        .await?;
 
         // Once this pipe owns EPX, wait for its transfer buffer to be free.
         self.wait_available().await
@@ -1024,6 +1044,8 @@ impl<'d, T: SealedHostInstance, E: pipe::Type, D: pipe::Direction> Channel<'d, T
         trace!("CHANNEL {} WAIT TRANSACTION", self.index);
         poll_fn(|cx| {
             self.waker().register(cx.waker());
+
+            self.check_present()?;
 
             if let Some(error) = T::host_state().take_epx_error(self.epx_slot()) {
                 return Poll::Ready(Err(error));
@@ -1707,6 +1729,10 @@ fn free_epx_mem(state: &HostState, addr: u16, len: u16) {
 impl<'d, T: SealedHostInstance> UsbHostAllocator<'d> for Allocator<'d, T> {
     type Pipe<E: pipe::Type, D: pipe::Direction> = Channel<'d, T, E, D>;
 
+    fn device_removed(&self, addrs: AddressSet) {
+        T::host_state().device_removed(addrs);
+    }
+
     fn alloc_pipe<E: pipe::Type, D: pipe::Direction>(
         &self,
         dev_addr: u8,
@@ -1845,10 +1871,6 @@ impl<'d, T: SealedHostInstance> UsbHostController<'d> for Driver<'d, T> {
         };
 
         self.connected = matches!(ev, DeviceEvent::Connected(_));
-
-        if ev == DeviceEvent::Disconnected {
-            T::host_state().device_removed(None);
-        }
 
         // Per the `UsbHostController` contract, reset before reporting the attach so the
         // device leaves Powered for Default (USB 2.0 §9.1.2). Full-speed only, so no chirp.
