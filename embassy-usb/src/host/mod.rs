@@ -570,80 +570,117 @@ pub fn bus<'d, C: UsbHostController<'d>>(
 
 #[cfg(test)]
 mod tests {
-    use embassy_usb_driver::host::TimeoutConfig;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+
+    use embassy_time::{Duration, MockDriver};
 
     use super::*;
+    use crate::mocks::host::{ControlScript, ControlStep, Recorder};
 
-    /// Allocator that records the set passed to `device_removed`.
-    #[derive(Clone)]
-    struct Recorder<'a>(&'a core::cell::Cell<AddressSet>, Option<&'a dyn Fn(AddressSet)>);
-
-    enum NoPipe {}
-
-    impl<T: pipe::Type, D: pipe::Direction> UsbPipe<T, D> for NoPipe {
-        async fn control_in(&mut self, _: &[u8; 8], _: &mut [u8]) -> Result<usize, PipeError>
-        where
-            T: pipe::IsControl,
-            D: pipe::IsIn,
-        {
-            match *self {}
-        }
-
-        async fn control_out(&mut self, _: &[u8; 8], _: &[u8]) -> Result<(), PipeError>
-        where
-            T: pipe::IsControl,
-            D: pipe::IsOut,
-        {
-            match *self {}
-        }
-
-        async fn request_in(&mut self, _: &mut [u8]) -> Result<usize, PipeError>
-        where
-            D: pipe::IsIn,
-        {
-            match *self {}
-        }
-
-        async fn request_out(&mut self, _: &[u8], _: bool) -> Result<(), PipeError>
-        where
-            D: pipe::IsOut,
-        {
-            match *self {}
-        }
-
-        fn set_timeout(&mut self, _: TimeoutConfig)
-        where
-            T: pipe::IsControl,
-        {
-            match *self {}
-        }
-
-        fn reset_data_toggle(&mut self)
-        where
-            T: pipe::IsBulkOrInterrupt,
-        {
-            match *self {}
+    fn run_with_mock_time<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                return result;
+            }
+            MockDriver::get().advance(Duration::from_millis(1));
         }
     }
 
-    impl<'a> UsbHostAllocator<'a> for Recorder<'a> {
-        type Pipe<T: pipe::Type, D: pipe::Direction> = NoPipe;
+    #[test]
+    fn enumerate_control_sequence() {
+        let device = [18, 1, 0, 2, 0, 0, 0, 64, 0x34, 0x12, 0x78, 0x56, 0, 1, 0, 0, 0, 1];
+        let configuration = [9, 2, 18, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 0, 0xff, 0, 0, 0];
+        let steps = [
+            ControlStep::Allocate {
+                address: 0,
+                max_packet_size: 8,
+            },
+            ControlStep::In {
+                setup: SetupPacket::get_device_descriptor(8),
+                data: &device[..8],
+            },
+            ControlStep::Out {
+                setup: SetupPacket::set_address(1),
+                data: &[],
+            },
+            ControlStep::Allocate {
+                address: 1,
+                max_packet_size: 64,
+            },
+            ControlStep::In {
+                setup: SetupPacket::get_device_descriptor(18),
+                data: &device,
+            },
+            ControlStep::In {
+                setup: SetupPacket::get_config_descriptor(0, 9),
+                data: &configuration[..9],
+            },
+            ControlStep::In {
+                setup: SetupPacket::get_config_descriptor(0, configuration.len() as u16),
+                data: &configuration,
+            },
+            ControlStep::Out {
+                setup: SetupPacket::set_configuration(1),
+                data: &[],
+            },
+        ];
+        let script = ControlScript::new(&steps);
+        let state = BusState::new();
+        let handle = BusHandle {
+            alloc: script.allocator(),
+            state: &state,
+        };
+        let mut config_buf = [0; 64];
 
-        fn alloc_pipe<T: pipe::Type, D: pipe::Direction>(
-            &self,
-            _: u8,
-            _: &EndpointInfo,
-            _: Option<SplitInfo>,
-        ) -> Result<NoPipe, HostError> {
-            Err(HostError::OutOfPipes)
-        }
+        let (info, length) = run_with_mock_time(handle.enumerate(BusRoute::Direct(Speed::Full), &mut config_buf))
+            .expect("enumeration should succeed");
 
-        fn device_removed(&self, addrs: AddressSet) {
-            self.0.set(addrs);
-            if let Some(on_removed) = self.1 {
-                on_removed(addrs);
-            }
-        }
+        assert_eq!(info.device_address, 1);
+        assert_eq!(info.device_desc.vendor_id, 0x1234);
+        assert_eq!(info.device_desc.product_id, 0x5678);
+        assert_eq!(&config_buf[..length], &configuration);
+        script.assert_finished();
+    }
+
+    #[test]
+    fn enumerate_retries_descriptor_and_frees_address_on_set_address_failure() {
+        let device_prefix = [18, 1, 0, 2, 0, 0, 0, 64];
+        let steps = [
+            ControlStep::Allocate {
+                address: 0,
+                max_packet_size: 8,
+            },
+            ControlStep::InError {
+                setup: SetupPacket::get_device_descriptor(8),
+                error: PipeError::Stall,
+            },
+            ControlStep::In {
+                setup: SetupPacket::get_device_descriptor(8),
+                data: &device_prefix,
+            },
+            ControlStep::OutError {
+                setup: SetupPacket::set_address(1),
+                data: &[],
+                error: PipeError::Stall,
+            },
+        ];
+        let script = ControlScript::new(&steps);
+        let state = BusState::new();
+        let handle = BusHandle {
+            alloc: script.allocator(),
+            state: &state,
+        };
+        let mut config_buf = [0; 64];
+
+        let result = run_with_mock_time(handle.enumerate(BusRoute::Direct(Speed::Full), &mut config_buf));
+
+        assert!(matches!(result, Err(EnumerationError::Transfer(PipeError::Stall))));
+        assert_eq!(state.alloc_address(), Some(1));
+        script.assert_finished();
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub mod types;
 /// USB host support.
 pub mod host;
 
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod mocks;
+
 /// Milliseconds a new connection must stay stable.
 pub(crate) const DEVICE_DEBOUNCE_STABLE: u64 = 100;
 /// Milliseconds before giving up on a bouncing connection.
