@@ -1,9 +1,10 @@
-//! USB MIDI 1.0 class.
+//! USB MIDI class.
 
 mod packet;
 
 pub mod device;
 pub mod host;
+pub mod ump;
 
 pub use packet::*;
 
